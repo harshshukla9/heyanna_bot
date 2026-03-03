@@ -5,12 +5,26 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "chromadb>=1.5.2",
+    "ddgs>=9.11.1",
     "duckdb>=1.4.4",
+    "duckduckgo-search>=8.1.1",
     "eth-account>=0.13.7",
+    "fastmcp>=3.0.2",
+    "langchain>=1.2.10",
+    "langchain-community>=0.4.1",
+    "langchain-huggingface>=1.2.1",
+    "langchain-openai>=1.1.10",
+    "langgraph>=1.0.10",
+    "mcp>=1.26.0",
     "openai>=2.24.0",
+    "py-clob-client>=0.34.6",
     "python-dotenv>=1.2.2",
     "python-telegram-bot>=22.6",
+    "sentence-transformers>=5.2.3",
+    "sentencepiece>=0.2.1",
     "solana>=0.36.11",
     "solders>=0.27.1",
+    "tavily-python>=0.7.22",
     "web3>=7.14.1",
 ]
