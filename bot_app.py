@@ -7,7 +7,7 @@ import time
 from typing import Dict, List
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update, ReplyKeyboardMarkup
-from telegram.error import BadRequest, TimedOut
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
 
 from api_app import strip_emoji
 from telegram.ext import (
@@ -595,6 +595,55 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                     pass
             raise
 
+    def _friendly_error_message(err: Exception) -> str | None:
+        """
+        Map low-level exceptions to actionable user-facing messages.
+        Return None for ignorable errors.
+        """
+        if err is None:
+            return "Something went wrong while handling that action. Please try again."
+
+        msg = str(err)
+        low = msg.lower()
+
+        # Telegram API specific noise that users shouldn't see.
+        if isinstance(err, BadRequest) and "message is not modified" in low:
+            return None
+
+        # Telegram edit/caption quirks.
+        if "there is no text in the message to edit" in low:
+            return (
+                "That menu card cannot be edited in place. Please tap the button again, "
+                "or open /menu and retry."
+            )
+        if "can't parse entities" in low:
+            return "Message formatting failed. Please retry; if this keeps happening, refresh the menu."
+
+        # Rate limits and transient network issues.
+        if isinstance(err, RetryAfter) or "too many requests" in low:
+            return "Too many requests at once. Please wait a few seconds and try again."
+        if isinstance(err, (TimedOut, NetworkError)) or "timed out" in low:
+            return "The request timed out. Please retry in a few seconds."
+        if "connection" in low and ("reset" in low or "aborted" in low or "closed" in low):
+            return "Network connection dropped. Please try again."
+
+        # Permissions / bot access.
+        if isinstance(err, Forbidden) or "forbidden" in low:
+            return "I don’t have permission to complete that action in this chat."
+
+        # Trading and relayer errors users can act on.
+        if "allowance" in low or "not enough balance" in low:
+            return "Insufficient balance/allowance. Try /approve, then fund your trading wallet and retry."
+        if "expected safe" in low and "not deployed" in low:
+            return "Your trading Safe is not deployed yet. Run /approve once, then retry."
+        if "no orderbook exists for the requested token id" in low:
+            return "That market is not currently tradable from the orderbook. Try another market."
+        if "market not found" in low:
+            return "Market data is stale. Please refresh markets and try again."
+
+        # Generic fallback.
+        return "Something went wrong while handling that action. Please try again."
+
     async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Formal /start command to initialize a user or handle deep links."""
         user = update.effective_user
@@ -771,6 +820,10 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 ],
                 [
                     InlineKeyboardButton("❓ Help", callback_data="home:help"),
+                    InlineKeyboardButton(
+                        "💬 Community",
+                        url="https://t.me/+i9D5bDox8lNmNDk9",
+                    ),
                 ],
             ]
         )
@@ -1456,7 +1509,7 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             ]
         )
         if hasattr(target, "edit_message_text"):
-            await target.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+            await _safe_edit_message(target, text, parse_mode="Markdown", reply_markup=keyboard)
         else:
             await target.reply_text(
                 text + "\n\nYou can also type a number (e.g. 10) or type `none`.",
@@ -1481,7 +1534,7 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             ]
         )
         if hasattr(target, "edit_message_text"):
-            await target.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+            await _safe_edit_message(target, text, parse_mode="Markdown", reply_markup=keyboard)
         else:
             await target.reply_text(
                 text + "\n\nYou can also type `fractional`, `1:1`, or `beginner`.",
@@ -1581,7 +1634,7 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         action = data.split(":", 1)[1].strip()
         db_user = db.get_user(query.from_user.id) if query.from_user else None
         if not db_user:
-            await query.edit_message_text("Please run /start first.")
+            await _safe_edit_message(query, "Please run /start first.")
             return
 
         if action == "enable":
@@ -1605,7 +1658,8 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 except Exception as e:
                     logging.getLogger(__name__).warning(f"Failed to reload hooks: {e}")
 
-            await query.edit_message_text(
+            await _safe_edit_message(
+                query,
                 "✅ Copy trading enabled.\n\nYour existing hooks (if any) are now active.",
                 reply_markup=InlineKeyboardMarkup(
                     [
@@ -1635,7 +1689,8 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 except Exception as e:
                     logging.getLogger(__name__).warning(f"Failed to reload hooks: {e}")
 
-            await query.edit_message_text(
+            await _safe_edit_message(
+                query,
                 "⏸ Copy trading disabled.\n\nHooks remain saved but will not fire until you enable again.",
                 reply_markup=InlineKeyboardMarkup(
                     [
@@ -1657,7 +1712,7 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             # Show all followed leaders with unfollow buttons
             db_user = db.get_user(query.from_user.id)
             if not db_user:
-                await query.edit_message_text("Please run /start first.")
+                await _safe_edit_message(query, "Please run /start first.")
                 return
 
             user_id = db_user["user_id"]
@@ -1667,7 +1722,8 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             ).fetchall()
 
             if not rows:
-                await query.edit_message_text(
+                await _safe_edit_message(
+                    query,
                     "You are not following any leaders yet.\n\nUse '➕ Follow by wallet address' to start.",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🏠 Main Menu", callback_data="home:main")]
@@ -1702,7 +1758,8 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 ])
             buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="copycfg:refresh")])
 
-            await query.edit_message_text(
+            await _safe_edit_message(
+                query,
                 "\n".join(lines),
                 parse_mode="HTML",
                 disable_web_page_preview=True,
@@ -1732,7 +1789,8 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 entries = []
 
             if not entries:
-                await query.edit_message_text(
+                await _safe_edit_message(
+                    query,
                     "Could not load global leaderboard right now. Please try again later.",
                 )
                 return
@@ -1766,7 +1824,8 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                     [InlineKeyboardButton("⬅️ Back", callback_data="copycfg:refresh")],
                 ]
             )
-            await query.edit_message_text(
+            await _safe_edit_message(
+                query,
                 "\n".join(lines),
                 parse_mode="HTML",
                 disable_web_page_preview=True,
@@ -1777,7 +1836,8 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         if action == "follow_manual":
             # Ask the user to send a wallet address to follow.
             context.user_data["awaiting_follow_wallet"] = True
-            await query.edit_message_text(
+            await _safe_edit_message(
+                query,
                 "Send the Polygon wallet address you want to follow for copy trading.\n\n"
                 "Example:\n0xabc123...",
             )
@@ -1804,7 +1864,8 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 except Exception as e:
                     logging.getLogger(__name__).warning(f"Failed to reload hooks: {e}")
 
-            await query.edit_message_text(
+            await _safe_edit_message(
+                query,
                 "🚫 You are no longer following any leaders for copy trading.",
             )
             return
@@ -2012,7 +2073,8 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             return
         choice = data.split(":", 1)[1].strip()
         if choice == "view_more":
-            await query.edit_message_text(
+            await _safe_edit_message(
+                query,
                 "Smart Wallet directories and leader discovery will live in the Mini App.\n\n"
                 "For now, use the Copy‑trading panel to manage who you follow.",
                 parse_mode="Markdown",
@@ -2025,7 +2087,8 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             )
             return
 
-        await query.edit_message_text(
+        await _safe_edit_message(
+            query,
             "Use /copy or the *Copy trading* menu to review settings, then enable copy trading to mirror your chosen leaders.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(
@@ -2050,12 +2113,12 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         try:
             hook_id = int(data.split(":")[1])
         except (ValueError, IndexError):
-            await query.edit_message_text("Invalid hook ID.")
+            await _safe_edit_message(query, "Invalid hook ID.")
             return
 
         db_user = db.get_user(query.from_user.id) if query.from_user else None
         if not db_user:
-            await query.edit_message_text("Please run /start first.")
+            await _safe_edit_message(query, "Please run /start first.")
             return
 
         # Delete the hook - need to get leader_address first
@@ -2079,7 +2142,8 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             except Exception as e:
                 logging.getLogger(__name__).warning(f"Failed to reload hooks: {e}")
 
-        await query.edit_message_text(
+        await _safe_edit_message(
+            query,
             "✅ You have stopped following this leader.",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("🔄 Refresh", callback_data="copycfg:refresh")]]
@@ -2100,12 +2164,12 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         user = query.from_user
         db_user = db.get_user(user.id) if user else None
         if not db_user:
-            await query.edit_message_text("Please run /start first.")
+            await _safe_edit_message(query, "Please run /start first.")
             return
 
         import re
         if not re.fullmatch(r"0x[a-fA-F0-9]{40}", wallet):
-            await query.edit_message_text("Invalid wallet address for follow.")
+            await _safe_edit_message(query, "Invalid wallet address for follow.")
             return
 
         # Defer hook creation until we know the user's risk settings.
@@ -2128,7 +2192,8 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
 
         pending_wallet = context.user_data.get("pending_follow_wallet")
         if not pending_wallet:
-            await query.edit_message_text(
+            await _safe_edit_message(
+                query,
                 "Follow flow expired. Open Copy Trading and choose a leader again."
             )
             return
@@ -2139,7 +2204,8 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             context.user_data["pending_follow_wallet"] = None
             context.user_data["pending_follow_max_per"] = None
             context.user_data["pending_follow_name"] = None
-            await query.edit_message_text(
+            await _safe_edit_message(
+                query,
                 "Cancelled follow setup.",
                 reply_markup=InlineKeyboardMarkup(
                     [[InlineKeyboardButton("👥 Back to Copy Trading", callback_data="copycfg:refresh")]]
@@ -2155,7 +2221,7 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 if max_per <= 0:
                     raise ValueError
             except ValueError:
-                await query.edit_message_text("Invalid risk value. Please try again.")
+                await _safe_edit_message(query, "Invalid risk value. Please try again.")
                 return
 
         context.user_data["pending_follow_max_per"] = max_per
@@ -2176,13 +2242,14 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         choice = data.split(":", 1)[1].strip().lower()
         db_user = db.get_user(query.from_user.id) if query.from_user else None
         if not db_user:
-            await query.edit_message_text("Please run /start first.")
+            await _safe_edit_message(query, "Please run /start first.")
             return
 
         pending_wallet = context.user_data.get("pending_follow_wallet")
         max_per = float(context.user_data.get("pending_follow_max_per", 0.0) or 0.0)
         if not pending_wallet:
-            await query.edit_message_text(
+            await _safe_edit_message(
+                query,
                 "Follow flow expired. Open Copy Trading and choose a leader again."
             )
             return
@@ -2192,7 +2259,8 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             context.user_data["pending_follow_wallet"] = None
             context.user_data["pending_follow_max_per"] = None
             context.user_data["pending_follow_name"] = None
-            await query.edit_message_text(
+            await _safe_edit_message(
+                query,
                 "Cancelled follow setup.",
                 reply_markup=InlineKeyboardMarkup(
                     [[InlineKeyboardButton("👥 Back to Copy Trading", callback_data="copycfg:refresh")]]
@@ -2202,7 +2270,7 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
 
         mode = choice
         if mode not in ("fractional", "one_to_one", "beginner"):
-            await query.edit_message_text("Invalid mode. Please choose one of the buttons.")
+            await _safe_edit_message(query, "Invalid mode. Please choose one of the buttons.")
             return
 
         msg, _ = await _finalize_follow_for_user(
@@ -2212,7 +2280,8 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             max_per=max_per,
             mode=mode,
         )
-        await query.edit_message_text(
+        await _safe_edit_message(
+            query,
             msg,
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(
@@ -2238,17 +2307,19 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         user = query.from_user
         db_user = db.get_user(user.id) if user else None
         if not db_user:
-            await query.edit_message_text("Please run /start first.")
+            await _safe_edit_message(query, "Please run /start first.")
             return
 
         if action == "pk":
             pk = (db_user.get("eth_private_key") or "").strip()
             if not pk:
-                await query.edit_message_text(
+                await _safe_edit_message(
+                    query,
                     "No private key found for this wallet.",
                 )
                 return
-            await query.edit_message_text(
+            await _safe_edit_message(
+                query,
                 "⚠️ Export Private Key\n\n"
                 "Your private key gives FULL access to your funds.\n"
                 "Only use this in a secure, developer environment.\n\n"
@@ -2456,7 +2527,7 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
 
         if action == "account":
             if not db_user:
-                await query.edit_message_text("Please run /start first.")
+                await _safe_edit_message(query, "Please run /start first.")
                 return
             await _send_account_overview(query.message.chat_id, context.bot, db_user)
             return
@@ -2468,7 +2539,7 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 "• To *withdraw*, use **Portfolio & wallet → Withdraw** to move USDC.e from Safe back to your main wallet.\n"
                 "• Use *Claim winnings* after markets resolve."
             )
-            await query.edit_message_text(msg, parse_mode="Markdown")
+            await _safe_edit_message(query, msg, parse_mode="Markdown")
             return
 
         if action == "copy":
@@ -2477,7 +2548,7 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 "Follow top trader wallets and let Anna mirror their trades to your account.\n"
                 "You control when copying is enabled, who you follow, and your per-trade risk settings."
             )
-            await query.edit_message_text(msg, parse_mode="Markdown")
+            await _safe_edit_message(query, msg, parse_mode="Markdown")
             return
 
     async def portfolio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2538,7 +2609,7 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         db_user = db.get_user(user.id) if user else None
         if not db_user:
             if query.message:
-                await query.edit_message_text("Please run /start first.")
+                await _safe_edit_message(query, "Please run /start first.")
             return
 
         address = db_user["eth_address"]
@@ -2546,7 +2617,8 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         if data == "portfolio:view":
             # Show detailed positions view with Close buttons
             if query.message:
-                await query.edit_message_text(
+                await _safe_edit_message(
+                    query,
                     "Fetching your open positions…",
                     parse_mode="Markdown",
                 )
@@ -2556,7 +2628,8 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         if data == "withdraw:funds":
             # Withdraw all USDC.e from Safe trading wallet back to EOA.
             if query.message:
-                await query.edit_message_text(
+                await _safe_edit_message(
+                    query,
                     "🔁 Withdrawing USDC.e from your Safe trading wallet back to your main address…",
                     parse_mode="Markdown",
                 )
@@ -2566,7 +2639,8 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 "all",
             )
             if query.message:
-                await query.edit_message_text(
+                await _safe_edit_message(
+                    query,
                     strip_emoji(result),
                     parse_mode="Markdown",
                 )
@@ -2575,7 +2649,8 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         if data == "transfer:safe":
             # Transfer all bridged USDC.e from EOA to Safe trading wallet.
             if query.message:
-                await query.edit_message_text(
+                await _safe_edit_message(
+                    query,
                     "🔁 Transferring USDC.e from your main address to your Safe trading wallet…",
                     parse_mode="Markdown",
                 )
@@ -2585,7 +2660,8 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 "all",
             )
             if query.message:
-                await query.edit_message_text(
+                await _safe_edit_message(
+                    query,
                     strip_emoji(result),
                     parse_mode="Markdown",
                 )
@@ -2653,7 +2729,8 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 ]
             )
             if query.message:
-                await query.edit_message_text(
+                await _safe_edit_message(
+                    query,
                     text,
                     parse_mode="Markdown",
                     reply_markup=buttons,
@@ -2671,14 +2748,36 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         if data == "claim:all":
             # Claim via gasless relay using Builder + CTF redeemPositions helper
             if query.message:
-                await query.edit_message_text(
+                await _safe_edit_message(
+                    query,
                     "🏆 Claiming winnings from resolved markets…",
                     parse_mode="Markdown",
                 )
             result = await asyncio.to_thread(bot_tools.claim_polymarket_winnings, address)
+            raw_result = str(result or "")
+            low = raw_result.lower()
+            if any(
+                token in low
+                for token in (
+                    "no unclaimed winnings",
+                    "no open positions to claim",
+                    "no closed positions found to claim",
+                    "no valid redeemable positions found",
+                    "transaction did not return a receipt",
+                )
+            ):
+                display_text = "No unclaimed winnings."
+            elif low.startswith("❌") or "claim via relayer failed" in low:
+                display_text = (
+                    "No unclaimed winnings right now. "
+                    "If a market just resolved, please try again in a minute."
+                )
+            else:
+                display_text = strip_emoji(raw_result)
             if query.message:
-                await query.edit_message_text(
-                    strip_emoji(result),
+                await _safe_edit_message(
+                    query,
+                    display_text,
                     parse_mode="Markdown",
                 )
             return
@@ -2696,11 +2795,11 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         try:
             idx = int(data.split(":", 1)[1])
         except (ValueError, IndexError):
-            await query.edit_message_text("Invalid close request.")
+            await _safe_edit_message(query, "Invalid close request.")
             return
         positions = context.user_data.get("portfolio_positions", [])
         if idx < 0 or idx >= len(positions):
-            await query.edit_message_text("Position no longer available. Run /portfolio again.")
+            await _safe_edit_message(query, "Position no longer available. Run /portfolio again.")
             return
         pos = positions[idx]
         cid = pos.get("condition_id", "")
@@ -2708,23 +2807,23 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         size = float(pos.get("size", 0))
         cur_price = float(pos.get("cur_price", 0))
         if not cid or size <= 0:
-            await query.edit_message_text("Cannot close this position.")
+            await _safe_edit_message(query, "Cannot close this position.")
             return
         m = market_cache.ensure_market_cached(cid)
         if not m:
-            await query.edit_message_text("Market not found. Run /portfolio again.")
+            await _safe_edit_message(query, "Market not found. Run /portfolio again.")
             return
         user_id = query.from_user.id if query.from_user else None
         db_user = db.get_user(user_id) if user_id else None
         if not db_user:
-            await query.edit_message_text("Please run /start first.")
+            await _safe_edit_message(query, "Please run /start first.")
             return
-        await query.edit_message_text(f"Selling {size:.2f} {outcome} to close position #{m.market_id}...")
+        await _safe_edit_message(query, f"Selling {size:.2f} {outcome} to close position #{m.market_id}...")
         res = await asyncio.to_thread(
             bot_tools.execute_sell_position,
             m.market_id, outcome, size, db_user["eth_address"],
         )
-        await query.edit_message_text(res)
+        await _safe_edit_message(query, res)
 
     async def swap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Formal /swap command."""
@@ -3031,7 +3130,10 @@ RULES:
             )
         except Exception as e:
             logger.error(f"Error calling LLM: {e}")
-            await update.message.reply_text("Sorry, I'm having trouble thinking right now.")
+            await update.message.reply_text(
+                "I couldn't process that request right now. Please try again in a few seconds "
+                "or use menu buttons for faster actions."
+            )
 
     async def handle_market_detail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle market detail page: show full market info with trade, analyze, and position buttons."""
@@ -3047,7 +3149,7 @@ RULES:
 
         market_id, condition_id, m = _resolve_market_identifier(identifier)
         if not m:
-            await query.edit_message_text("Market not found. Run /markets to refresh.")
+            await _safe_edit_message(query, "Market not found. Run /markets to refresh.")
             return
 
         # Store market context for this user
@@ -3134,7 +3236,7 @@ _Tap buttons below to trade or analyze._"""
 
         details = bot_tools.get_market_by_id(market_id)
         if "not found" in details.lower():
-            await query.edit_message_text(details)
+            await _safe_edit_message(query, details)
             return
 
         # Cache structured market object (if available) for richer context
@@ -3216,13 +3318,14 @@ _Tap buttons below to trade or analyze._"""
 
         market_id, condition_id, m = _resolve_market_identifier(identifier)
         if not m:
-            await query.edit_message_text("Market no longer in cache. Run /markets to refresh.")
+            await _safe_edit_message(query, "Market no longer in cache. Run /markets to refresh.")
             return
 
         question = _mget(m, "question", "") or "this market"
 
         # Run the multi-stage news-grounded analysis using the market question
-        await query.edit_message_text(
+        await _safe_edit_message(
+            query,
             f"🔍 Analyzing market:\n\n{question}\n\nPlease wait…",
             parse_mode="Markdown",
         )
@@ -3230,8 +3333,9 @@ _Tap buttons below to trade or analyze._"""
             analysis = await llm.run_market_analysis(question)
         except Exception as e:
             logger.error(f"Error analyzing market {identifier}: {e}")
-            await query.edit_message_text(
-                "Sorry, I couldn't analyze this market right now.",
+            await _safe_edit_message(
+                query,
+                "I couldn't analyze this market right now. Please retry in a few seconds.",
                 parse_mode="Markdown",
             )
             return
@@ -3306,7 +3410,7 @@ _Tap buttons below to trade or analyze._"""
         market_id, condition_id, m = _resolve_market_identifier(identifier)
 
         if not m:
-            await query.edit_message_text("Market not found. Run /markets to refresh.")
+            await _safe_edit_message(query, "Market not found. Run /markets to refresh.")
             return
 
         user_id = query.from_user.id if query.from_user else None
@@ -3337,7 +3441,7 @@ _Tap buttons below to trade or analyze._"""
             db.get_user(update.effective_user.id) if update.effective_user else None
         )
         if not db_user:
-            await query.edit_message_text("Please run /start first.")
+            await _safe_edit_message(query, "Please run /start first.")
             return
 
         amount_buttons = [
@@ -3361,7 +3465,8 @@ _Tap buttons below to trade or analyze._"""
             f"Odds: {m.odds.get(side, '?')}¢\n\n"
             f"Choose amount or type: `trade {display_id} {side} 10`"
         )
-        await query.edit_message_text(
+        await _safe_edit_message(
+            query,
             msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(amount_buttons)
         )
 
@@ -3383,17 +3488,17 @@ _Tap buttons below to trade or analyze._"""
         market_id, condition_id, m = _resolve_market_identifier(identifier)
 
         if not m:
-            await query.edit_message_text("Market not found. Run /markets to refresh.")
+            await _safe_edit_message(query, "Market not found. Run /markets to refresh.")
             return
 
         db_user = db.get_user(query.from_user.id) if query.from_user else None
         if not db_user:
-            await query.edit_message_text("Please run /start first.")
+            await _safe_edit_message(query, "Please run /start first.")
             return
 
         exec_condition_id = condition_id or (m.condition_id if m else None)
         if not exec_condition_id:
-            await query.edit_message_text("Could not resolve market for trade. Please refresh markets.")
+            await _safe_edit_message(query, "Could not resolve market for trade. Please refresh markets.")
             return
         res = await asyncio.to_thread(
             execute_trade_for_user,
@@ -3403,7 +3508,7 @@ _Tap buttons below to trade or analyze._"""
             amount,
             exec_condition_id,
         )
-        await query.edit_message_text(res)
+        await _safe_edit_message(query, res)
 
     async def post_init(app: Application) -> None:
         """Set bot command menu when application starts."""
@@ -3428,13 +3533,20 @@ _Tap buttons below to trade or analyze._"""
 
     async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Global error handler so Telegram exceptions are handled gracefully."""
-        logger.exception("Unhandled bot error: %s", context.error)
+        err = context.error
+        user_msg = _friendly_error_message(err)
+        if user_msg is None:
+            # Intentionally ignore noise such as "Message is not modified".
+            return
+
+        logger.exception("Unhandled bot error: %s", err)
         try:
+            if update and getattr(update, "callback_query", None):
+                query = update.callback_query
+                await _safe_edit_message(query, user_msg)
+                return
             if update and getattr(update, "effective_chat", None):
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text="Something went wrong handling that action. Please try again.",
-                )
+                await context.bot.send_message(chat_id=update.effective_chat.id, text=user_msg)
         except Exception:
             pass
 

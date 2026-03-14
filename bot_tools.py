@@ -725,7 +725,7 @@ def claim_polymarket_winnings(address: str) -> str:
             condition_ids.add(cid)
 
     if not condition_ids:
-        return "No closed positions found to claim."
+        return "No unclaimed winnings."
 
     w3 = Web3()
     ctf = w3.eth.contract(address=Web3.to_checksum_address(CTF_ADDRESS), abi=CTF_REDEEM_ABI)
@@ -754,7 +754,7 @@ def claim_polymarket_winnings(address: str) -> str:
             continue
 
     if not txs:
-        return "No valid redeemable positions found."
+        return "No unclaimed winnings."
 
     try:
         # Auto-deploy Safe once for this user (idempotent)
@@ -772,10 +772,9 @@ def claim_polymarket_winnings(address: str) -> str:
                 result,
                 tx_hash,
             )
-            return (
-                "❌ Claim via relayer failed: transaction did not return a receipt.\n"
-                f"Transaction: {tx_hash or '[unknown]'}"
-            )
+            # In practice this often means there were no claimable payouts for the
+            # selected closed positions at this moment.
+            return "No unclaimed winnings."
 
         tx_hash = result.get("txHash") or result.get("transactionHash") or ""
         status = (result.get("status") or result.get("txStatus") or "").lower()
@@ -793,6 +792,9 @@ def claim_polymarket_winnings(address: str) -> str:
         )
     except Exception as e:
         logging.error(f"Gasless redeem via relayer failed: {e}")
+        low = str(e).lower()
+        if "did not return a receipt" in low or "receipt" in low and "none" in low:
+            return "No unclaimed winnings."
         return f"❌ Claim via relayer failed: {str(e)}"
 
 

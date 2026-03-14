@@ -160,17 +160,45 @@ def _fetch_closed_positions_sync(addr: str) -> list:
     return data if isinstance(data, list) else []
 
 
-def _fetch_public_profile_sync(address: str) -> Dict[str, Any] | None:
+def _fetch_public_profile_sync(
+    address: str,
+    *,
+    force_refetch: bool = False,
+) -> Dict[str, Any] | None:
     """Sync fetch of Polymarket public profile by wallet address (Gamma API)."""
     addr = (address or "").strip()
     if not addr or not re.fullmatch(r"0x[a-fA-F0-9]{40}", addr):
         return None
+    if force_refetch:
+        try:
+            resp = requests.get(
+                "https://gamma-api.polymarket.com/public-profile",
+                params={"address": addr},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
     data = _fetch_url(
         "https://gamma-api.polymarket.com/public-profile",
         params={"address": addr},
         timeout=10,
     )
     return data if isinstance(data, dict) else None
+
+
+def _extract_polymarket_username(profile: Dict[str, Any] | None) -> str | None:
+    """Extract best-effort username from Gamma public-profile payload."""
+    if not isinstance(profile, dict):
+        return None
+    for key in ("username", "userName", "name", "displayName", "handle"):
+        val = profile.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
 
 
 def _get_balance_json_cached(addr: str) -> Dict[str, Any]:
@@ -1063,11 +1091,18 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
             config = json.loads(r.get("config") or "{}")
             leader_address = r.get("leader_address") or config.get("leader_address")
             if leader_address:
+                profile = await asyncio.to_thread(
+                    _fetch_public_profile_sync,
+                    leader_address,
+                    force_refetch=True,
+                )
+                poly_username = _extract_polymarket_username(profile)
                 leaders.append(
                     {
                         "hook_id": int(r["hook_id"]),
                         "leader_address": leader_address,
-                        "display_name": config.get("display_name") or leader_address[:10] + "...",
+                        "display_name": config.get("display_name") or poly_username or leader_address[:10] + "...",
+                        "polymarket_username": poly_username,
                         "config": config,
                     }
                 )
@@ -1526,11 +1561,18 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
             # Get leader info from config or use the address directly
             leader_address = row_dict.get("leader_address") or config.get("leader_address")
             if leader_address:
+                profile = await asyncio.to_thread(
+                    _fetch_public_profile_sync,
+                    leader_address,
+                    force_refetch=True,
+                )
+                poly_username = _extract_polymarket_username(profile)
                 leaders.append(
                     {
                         "hook_id": int(row_dict["hook_id"]),
                         "leader_address": leader_address,
-                        "display_name": config.get("display_name") or leader_address[:10] + "...",
+                        "display_name": config.get("display_name") or poly_username or leader_address[:10] + "...",
+                        "polymarket_username": poly_username,
                         "enabled": bool(row_dict.get("enabled") or 1),
                         "config": config,
                     }
