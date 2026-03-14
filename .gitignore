@@ -86,6 +86,7 @@ Thumbs.db
 .claude/
 .clude/
 agents/
+poly-agents/
 
 # -----------------------------
 # Redundant local docs
