@@ -1167,6 +1167,57 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         if not user:
             raise HTTPException(status_code=404, detail="User not found.")
 
+        notifications: list[Dict[str, Any]] = []
+
+        # Source A: global/external copy execution logs (copy_logs).
+        try:
+            log_rows = db.execute(
+                """
+                SELECT
+                    executed_at,
+                    condition_id,
+                    trade_side,
+                    trade_outcome,
+                    trade_price,
+                    trade_size,
+                    follower_amount,
+                    status,
+                    error_message,
+                    leader_address,
+                    hook_id
+                FROM copy_logs
+                WHERE follower_user_id = ?
+                ORDER BY executed_at DESC
+                LIMIT ?;
+                """,
+                (user["user_id"], limit),
+            ).fetchall()
+            for r in log_rows:
+                d = dict(r)
+                notifications.append(
+                    {
+                        "source": "global_hook",
+                        "executed_at": d.get("executed_at"),
+                        "market_id": None,
+                        "condition_id": d.get("condition_id"),
+                        "side": d.get("trade_outcome"),
+                        "amount": float(d.get("follower_amount") or 0.0),
+                        "size": float(d.get("trade_size") or 0.0) if d.get("trade_size") is not None else None,
+                        "price": float(d.get("trade_price") or 0.0) if d.get("trade_price") is not None else None,
+                        "order_side": d.get("trade_side"),
+                        "status": d.get("status"),
+                        "tx_hash": None,
+                        "leader_user_id": None,
+                        "leader_username": None,
+                        "leader_address": d.get("leader_address"),
+                        "hook_id": d.get("hook_id"),
+                        "error_message": d.get("error_message"),
+                    }
+                )
+        except Exception:
+            pass
+
+        # Source B: local-user copy executions recorded in trades.
         rows = db.execute(
             """
             SELECT
@@ -1191,12 +1242,11 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
             """,
             (user["user_id"], limit),
         ).fetchall()
-
-        notifications: list[Dict[str, Any]] = []
         for r in rows:
             d = dict(r)
             notifications.append(
                 {
+                    "source": "local_copy",
                     "executed_at": d.get("executed_at"),
                     "market_id": d.get("market_id"),
                     "condition_id": d.get("condition_id"),
@@ -1212,6 +1262,9 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                     "leader_address": d.get("leader_address"),
                 }
             )
+
+        notifications.sort(key=lambda n: int(n.get("executed_at") or 0), reverse=True)
+        notifications = notifications[:limit]
 
         return {
             "notifications": notifications,
