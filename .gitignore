@@ -1,12 +1,96 @@
-# Python-generated files
+# -----------------------------
+# Python / packaging
+# -----------------------------
 __pycache__/
-*.py[oc]
+*.py[cod]
+*$py.class
+*.so
 build/
 dist/
 wheels/
-*.egg-info
-*.duckdb
-*.csv
-*.env
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# -----------------------------
 # Virtual environments
-.venv
+# -----------------------------
+.venv/
+venv/
+env/
+.env/
+
+# -----------------------------
+# Environment / secrets
+# -----------------------------
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.secret
+
+# -----------------------------
+# Local databases / app state
+# -----------------------------
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.duckdb
+*.duckdb-*
+
+# -----------------------------
+# Data exports / local artifacts
+# -----------------------------
+*.csv
+*.parquet
+*.feather
+*.jsonl
+*.log
+logs/
+tmp/
+temp/
+.cache/
+
+# -----------------------------
+# Testing / tooling caches
+# -----------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# -----------------------------
+# IDE / editor
+# -----------------------------
+.vscode/
+.idea/
+.ipynb_checkpoints/
+
+# -----------------------------
+# OS files
+# -----------------------------
+.DS_Store
+Thumbs.db
+
+# -----------------------------
+# Local agent/tooling directories
+# -----------------------------
+.agents/
+.claude/
+.clude/
+agents/
+
+# -----------------------------
+# Redundant local docs
+# -----------------------------
+API_REFERENCE.md
+INTEGRATION.md
+PROGRAMMABLE_HOOKS.md
+doc.md
