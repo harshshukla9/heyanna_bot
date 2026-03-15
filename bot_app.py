@@ -162,7 +162,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 BOT_COMMANDS = [
     BotCommand("start", "Initialize wallet & show menu"),
     BotCommand("wallet", "Show your Polygon wallet address"),
-    BotCommand("balance", "Check token balances (Covalent)"),
+    BotCommand("balance", "Check token balances"),
     BotCommand("portfolio", "Funds + open positions & PnL"),
     BotCommand("copy", "Manage copy trading & smart wallets"),
     BotCommand("markets", "Browse trending Polymarket events"),

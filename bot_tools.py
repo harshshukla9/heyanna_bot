@@ -50,7 +50,6 @@ class _RelayTx:
 # Ensure we load env vars so we can get the DFLOW_API_KEY
 load_dotenv()
 DFLOW_API_KEY = os.getenv("DFLOW_API_KEY", "")
-COVALENT_API_KEY = os.getenv("COVALENT_API_KEY", "").strip()
 
 # Shared DB manager (SQLite + WAL)
 db = DatabaseManager()
@@ -107,57 +106,9 @@ def get_eth_balance(address: str) -> str:
         logging.error(f"Error fetching ETH balance: {e}")
         return "Error fetching ETH balance"
 
-def _fetch_balances_via_covalent(address: str) -> dict | None:
-    """
-    Fetch Polygon balances via Covalent/GoldRush API (single API call, includes prices).
-    Returns same format as _compute_polygon_balances_rpc or None on failure.
-    """
-    if not COVALENT_API_KEY:
-        return None
-    try:
-        checksum_address = Web3.to_checksum_address(address)
-        url = f"https://api.covalenthq.com/v1/polygon-mainnet/address/{checksum_address}/balances_v2/"
-        resp = requests.get(
-            url,
-            headers={"Authorization": f"Bearer {COVALENT_API_KEY}"},
-            params={"quote-currency": "USD"},
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            logging.warning(f"Covalent API error: {resp.status_code}")
-            return None
-        body = resp.json()
-        data = body.get("data") or body
-        items = data.get("items") or []
-        tokens_out: list[dict] = []
-        total_usd = 0.0
-        for item in items:
-            if item.get("is_spam"):
-                continue
-            balance_raw = item.get("balance") or "0"
-            decimals = int(item.get("contract_decimals", 18))
-            try:
-                balance = int(balance_raw) / (10**decimals)
-            except (ValueError, TypeError):
-                continue
-            if balance <= 0:
-                continue
-            quote = float(item.get("quote", 0) or 0)
-            symbol = item.get("contract_ticker_symbol") or "UNKNOWN"
-            if item.get("is_native_token") or item.get("native_token"):
-                symbol = "POL (native)"
-            tokens_out.append({"symbol": symbol, "balance": balance, "usd_value": quote})
-            total_usd += quote
-        return {"wallet": checksum_address, "tokens": tokens_out, "total_usd": total_usd}
-    except Exception as e:
-        logging.warning(f"Covalent balance fetch failed: {e}")
-        return None
-
-
 def _compute_polygon_balances_rpc(address: str) -> dict | None:
     """
-    Fallback: compute Polygon balances via direct RPC + CoinGecko.
-    Same return format as _fetch_balances_via_covalent.
+    Compute Polygon balances via direct RPC + CoinGecko.
     """
     try:
         checksum_address = Web3.to_checksum_address(address)
@@ -283,11 +234,8 @@ def _compute_polygon_balances_rpc(address: str) -> dict | None:
 
 def _compute_polygon_balances(address: str) -> dict | None:
     """
-    Compute Polygon balances: use Covalent/GoldRush if API key is set, else RPC.
+    Compute Polygon balances via RPC + CoinGecko.
     """
-    result = _fetch_balances_via_covalent(address)
-    if result is not None:
-        return result
     return _compute_polygon_balances_rpc(address)
 
 
