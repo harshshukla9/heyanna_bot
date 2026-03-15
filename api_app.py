@@ -3756,15 +3756,21 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
             (limit + offset,),
         ).fetchall()
 
+        from bot_tools import get_trading_wallet_address as _get_trading_wallet
+
         local_trades: list[Dict[str, Any]] = []
         for r in local_rows:
             r = dict(r)
+            wallet = r["eth_address"]
+            proxy_wallet = _get_trading_wallet(wallet) if wallet else wallet
             local_trades.append(
                 {
                     "id": r["id"],
                     "user_id": r["user_id"],
                     "username": r["username"],
                     "eth_address": r["eth_address"],
+                    "proxy_wallet": proxy_wallet,
+                    "proxyWallet": proxy_wallet,
                     "condition_id": r["condition_id"],
                     "side": r["side"],
                     "amount": (r.get("size") * r.get("price")) if (r.get("size") is not None and r.get("price") is not None) else r["amount"],
@@ -3833,11 +3839,15 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                     tx = _get_tx_hash(t)
                     size_val = t.get("size")
                     pm_side = (t.get("side") or "").upper()
+                    # Wallet for /users/{address}/portfolio; prefer Polymarket proxyWallet, else our trading wallet.
+                    proxy_wallet = t.get("proxyWallet") or t.get("proxy_wallet") or _get_trading_wallet(info["eth_address"]) or info["eth_address"]
                     enriched = {
                         **t,
                         "user_id": info["user_id"],
                         "username": info["username"],
                         "eth_address": info["eth_address"],
+                        "proxy_wallet": proxy_wallet,
+                        "proxyWallet": proxy_wallet,
                         "tx_hash": tx,
                         "tx_id": tx,
                         "shares": size_val,
