@@ -33,6 +33,72 @@ This document summarizes the HTTP endpoints exposed by the FastAPI app in `api_a
 
 ---
 
+### Onboarding & Invite Codes
+
+The onboarding system requires users to claim a valid invite code before accessing trading features.
+
+- **GET `/me/onboarded`** (auth)
+  - Checks if the current authenticated user has been onboarded.
+  - Response:
+    ```json
+    {
+      "onboarded": true|false,
+      "invite_code": "ABC123XYZ"  // null if not onboarded
+    }
+    ```
+
+- **POST `/me/onboard`** (auth)
+  - Claims an invite code to onboard the current user.
+  - **Request Body**:
+    ```json
+    {
+      "invite_code": "ABC123XYZ"
+    }
+    ```
+  - **Invite Code Properties**:
+    - **Single-use**: Each code can only be claimed once
+    - **No expiry**: Codes never expire by default
+    - **Case-insensitive**: Code is normalized to uppercase
+  - **Responses**:
+    - **200 OK** - Successfully claimed:
+      ```json
+      {
+        "success": true,
+        "message": "Successfully onboarded!",
+        "invite_code": "ABC123XYZ"
+      }
+      ```
+    - **400 Bad Request** - Invalid or already used code:
+      ```json
+      {
+        "detail": "Invalid invite code: <reason>"
+      }
+      ```
+    - **400 Bad Request** - User already onboarded:
+      ```json
+      {
+        "detail": "You are already onboarded."
+      }
+      ```
+  - **Example**:
+    ```bash
+    curl -X POST "http://localhost:7051/me/onboard" \
+        -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d '{"invite_code": "ABC123XYZ"}'
+    ```
+
+**Related Admin Endpoints**:
+- `POST /admin/invite-codes/generate` - Generate a single invite code (admin only)
+- `POST /admin/invite-codes/generate-bulk?count=N` - Generate N invite codes (admin only)
+- `GET /admin/invite-codes` - List all invite codes (admin only)
+- `POST /admin/invite-codes/{code}/deactivate` - Deactivate a code (admin only)
+  - **WARNING**: Also revokes access from users who claimed this code
+- `DELETE /admin/invite-codes/delete/{code}` - Delete a code permanently (admin only)
+  - **WARNING**: Also revokes access from users who claimed this code
+
+---
+
 ### User & Wallet
 
 All require auth (`Authorization: Bearer <jwt>`).
