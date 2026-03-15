@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import hashlib
 import hmac
 import json
@@ -702,6 +703,57 @@ def _get_usdc_balance_usd(balance_json: Dict[str, Any]) -> float:
     return total
 
 
+# In-memory buffer for signals from the in-process listener daemon (latest, time-accurate).
+_ANNOUNCEMENT_SIGNALS_BUFFER: collections.deque = collections.deque(maxlen=500)
+
+
+def _load_announcement_signals(path: str, max_count: int) -> list[Dict[str, Any]]:
+    """
+    Load parsed announcement signals from the JSONL file written by the listener
+    and from the in-process daemon buffer. Merges both for latest and time-accurate
+    data. Returns up to max_count items sorted by signal_ts descending.
+    """
+    out: list[Dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    if not path or max_count <= 0:
+        return out
+    p = os.path.abspath(os.path.expanduser(path))
+    if os.path.isfile(p):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    if not obj.get("parsed"):
+                        continue
+                    signal_ts = obj.get("signal_ts")
+                    if signal_ts is None:
+                        continue
+                    key = obj.get("message_key") or ""
+                    if key:
+                        seen_keys.add(key)
+                    out.append(obj)
+        except Exception:
+            pass
+    # Merge in any from the daemon buffer not already in file (latest, time-accurate).
+    for obj in _ANNOUNCEMENT_SIGNALS_BUFFER:
+        if not obj.get("parsed") or obj.get("signal_ts") is None:
+            continue
+        key = obj.get("message_key") or ""
+        if key and key in seen_keys:
+            continue
+        if key:
+            seen_keys.add(key)
+        out.append(dict(obj))
+    out.sort(key=lambda x: int(x.get("signal_ts") or 0), reverse=True)
+    return out[:max_count]
+
+
 def _compute_fractional_amount_for_hook(
     leader_address: str,
     follower_user_id: int,
@@ -1124,11 +1176,14 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         condition_id: str,
         order_side: str,
         leader_address: str = "",
-        hook_id: int = None
+        hook_id: int = None,
+        token_id: str = None,
+        outcome_index: int = None,
     ):
         """
         Callback for executing copy trades.
         This is called by the WebSocket tracker when a tracked wallet makes a trade.
+        token_id / outcome_index resolve outcome to market's actual name (e.g. NSH not Yes/Under).
         """
         try:
             logging.getLogger(__name__).info(
@@ -1136,7 +1191,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                 f"Amount=${amount_usd:.2f} Condition={condition_id[:20]}... Side={order_side}"
             )
 
-            # Execute the trade using existing function
+            # Execute the trade; pass token_id/outcome_index so we use market's outcome name
             result = await asyncio.to_thread(
                 execute_trade_for_user,
                 db,
@@ -1145,7 +1200,9 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                 amount_usd,
                 condition_id,
                 order_side,
-                copied_from_user_id=None
+                copied_from_user_id=None,
+                token_id=token_id,
+                outcome_index=outcome_index,
             )
 
             logging.getLogger(__name__).info(f"[COPY TRADE] Result: {result}")
@@ -1212,6 +1269,38 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         else:
             logging.getLogger(__name__).info("[COPY TRADING] Using polling mode")
             asyncio.create_task(_global_copy_trading_loop_polling())
+
+        # API's own daemon: run Telegram announcement signal listener in-process for latest and time-accurate notifications.
+        # Enabled when ENABLE_TELEGRAM_SIGNAL_LISTENER=1 or when TELEGRAM_SIGNAL_CHAT + API_ID + API_HASH are set.
+        enable_listener = (
+            os.getenv("ENABLE_TELEGRAM_SIGNAL_LISTENER", "").strip().lower() in ("1", "true", "yes")
+            or bool(
+                os.getenv("TELEGRAM_SIGNAL_CHAT")
+                and os.getenv("TELEGRAM_API_ID")
+                and os.getenv("TELEGRAM_API_HASH")
+            )
+        )
+        if enable_listener:
+            async def _telegram_signal_listener_loop() -> None:
+                try:
+                    import sys
+                    from pathlib import Path
+                    scripts_dir = Path(__file__).resolve().parent / "scripts"
+                    if str(scripts_dir) not in sys.path:
+                        sys.path.insert(0, str(scripts_dir))
+                    from telegram_announcement_listener import run_listener, _load_config_from_env
+                    cfg = _load_config_from_env()
+                    logging.getLogger(__name__).info(
+                        "[TELEGRAM SIGNAL LISTENER] Starting API daemon (latest + time-accurate data for /me/copy-trading/notifications)"
+                    )
+                    # Push each new signal into buffer so notifications endpoint has latest without re-read delay.
+                    await run_listener(cfg, on_signal=lambda p: _ANNOUNCEMENT_SIGNALS_BUFFER.append(p))
+                except Exception as e:
+                    logging.getLogger(__name__).warning(
+                        "[TELEGRAM SIGNAL LISTENER] Daemon failed or stopped: %s. Set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SIGNAL_CHAT and run scripts/telegram_announcement_listener.py once to log in.",
+                        e,
+                    )
+            asyncio.create_task(_telegram_signal_listener_loop())
 
     @app.get("/health", tags=["system"], summary="Health check")
     async def health():
@@ -2075,9 +2164,9 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
 
         notifications: list[Dict[str, Any]] = []
 
-        # Source A: global/external copy execution logs (copy_logs).
+        # Notifications = hook_log for this user only (WebSocket copy tracker executions).
         try:
-            log_rows = db.execute(
+            hook_rows = db.execute(
                 """
                 SELECT
                     executed_at,
@@ -2090,20 +2179,24 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                     status,
                     error_message,
                     leader_address,
-                    hook_id
-                FROM copy_logs
+                    hook_id,
+                    market_title
+                FROM hook_logs
                 WHERE follower_user_id = ?
                 ORDER BY executed_at DESC
                 LIMIT ?;
                 """,
                 (user["user_id"], limit),
             ).fetchall()
-            for r in log_rows:
+            for r in hook_rows:
                 d = dict(r)
+                ts = d.get("executed_at")
+                ts_display = datetime.utcfromtimestamp(ts).isoformat() + "Z" if ts is not None else None
                 notifications.append(
                     {
-                        "source": "global_hook",
-                        "executed_at": d.get("executed_at"),
+                        "source": "hook_log",
+                        "executed_at": ts,
+                        "timestamp": ts_display,
                         "market_id": None,
                         "condition_id": d.get("condition_id"),
                         "side": d.get("trade_outcome"),
@@ -2118,54 +2211,51 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                         "leader_address": d.get("leader_address"),
                         "hook_id": d.get("hook_id"),
                         "error_message": d.get("error_message"),
+                        "market_title": d.get("market_title"),
                     }
                 )
         except Exception:
             pass
 
-        # Source B: local-user copy executions recorded in trades.
-        rows = db.execute(
-            """
-            SELECT
-                t.executed_at,
-                t.market_id,
-                t.condition_id,
-                t.side,
-                t.amount,
-                t.size,
-                t.price,
-                t.order_side,
-                t.status,
-                t.tx_hash,
-                t.copied_from_user_id,
-                u.username AS leader_username,
-                u.eth_address AS leader_address
-            FROM trades t
-            LEFT JOIN users u ON u.user_id = t.copied_from_user_id
-            WHERE t.user_id = ? AND t.copied_from_user_id IS NOT NULL
-            ORDER BY t.executed_at DESC
-            LIMIT ?;
-            """,
-            (user["user_id"], limit),
-        ).fetchall()
-        for r in rows:
-            d = dict(r)
+        # Announcement signals from scripts/telegram_announcement_listener.py (JSONL).
+        signal_path = os.getenv("TELEGRAM_SIGNAL_OUTPUT", "logs/announcement_signals.jsonl")
+        for sig in _load_announcement_signals(signal_path, limit * 2):
+            signal_ts = int(sig.get("signal_ts") or 0)
+            # Timestamp for display: prefer "21:40 UTC", else ISO, else from executed_at.
+            timestamp_display = (
+                sig.get("time_utc_display")
+                or sig.get("signal_at")
+                or (datetime.utcfromtimestamp(signal_ts).isoformat() + "Z" if signal_ts else None)
+            )
             notifications.append(
                 {
-                    "source": "local_copy",
-                    "executed_at": d.get("executed_at"),
-                    "market_id": d.get("market_id"),
-                    "condition_id": d.get("condition_id"),
-                    "side": d.get("side"),
-                    "amount": float(d.get("amount") or 0.0),
-                    "size": float(d.get("size") or 0.0) if d.get("size") is not None else None,
-                    "price": float(d.get("price") or 0.0) if d.get("price") is not None else None,
-                    "order_side": d.get("order_side"),
-                    "status": d.get("status"),
-                    "tx_hash": d.get("tx_hash"),
-                    "leader_user_id": d.get("copied_from_user_id"),
-                    "leader_username": d.get("leader_username"),
-                    "leader_address": d.get("leader_address"),
+                    "source": "announcement_signal",
+                    "executed_at": signal_ts,
+                    "timestamp": timestamp_display,  # signal time for display, e.g. "21:40 UTC"
+                    "market_id": None,
+                    "condition_id": None,
+                    "side": sig.get("signal"),  # YES | NO
+                    "amount": None,
+                    "size": None,
+                    "price": None,
+                    "order_side": "BUY",
+                    "status": "signal",
+                    "tx_hash": None,
+                    "leader_user_id": None,
+                    "leader_username": None,
+                    "leader_address": None,
+                    "hook_id": None,
+                    "error_message": None,
+                    "market_title": sig.get("market"),
+                    "timeframe": sig.get("timeframe"),
+                    "market_end_ts": sig.get("market_end_ts"),
+                    "market_end_at": sig.get("market_end_at"),
+                    "asset": sig.get("asset"),
+                    "direction": sig.get("direction"),
+                    "confidence_pct": sig.get("confidence_pct"),
+                    "chat_title": sig.get("chat_title"),
+                    "signal_at": sig.get("signal_at"),
+                    "time_utc_display": sig.get("time_utc_display"),  # e.g. "21:40 UTC"
                 }
             )
 

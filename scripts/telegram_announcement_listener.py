@@ -22,7 +22,12 @@ Optional env:
   TELEGRAM_SIGNAL_OUTPUT=logs/announcement_signals.jsonl
   TELEGRAM_SIGNAL_HISTORY_DAYS=7    # backfill window in days
   TELEGRAM_SIGNAL_HISTORY_LIMIT=0   # optional hard cap (0 = no cap)
-  TELEGRAM_SIGNAL_LOG_RAW=0        # set 1 to log unmatched messages too
+  TELEGRAM_SIGNAL_LOG_RAW=0         # set 1 to log unmatched messages too
+
+To run in-process with the API (same as running this script): set
+  ENABLE_TELEGRAM_SIGNAL_LISTENER=1
+in the API environment. Run this script once manually to log in (phone), then
+the API can start the listener on startup.
 """
 
 from __future__ import annotations
@@ -37,7 +42,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # Place trade before this time: signal arrival + 5 min or 15 min etc.
 TIMEFRAME_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600}
@@ -178,8 +183,27 @@ def parse_signal_from_text(text: str) -> dict[str, Any] | None:
     elif re.search(r"\b(short|buy\s*no|no|bear|down|put)\b", low) or "🔴" in src or re.search(r"▼\s*down", low):
         side = "NO"
 
-    # Skip non-actionable chatter.
-    if not timeframe and not side:
+    # Parse "Time:      21:40 UTC" first; when present, signal time is that time and default +5 min window.
+    time_utc_hour: int | None = None
+    time_utc_min: int | None = None
+    time_utc_display: str | None = None
+    m_time = re.search(r"Time:\s*(\d{1,2}):(\d{2})\s*UTC", src, re.IGNORECASE)
+    if m_time:
+        try:
+            time_utc_hour = int(m_time.group(1)) % 24
+            time_utc_min = int(m_time.group(2)) % 60
+            time_utc_display = f"{time_utc_hour:02d}:{time_utc_min:02d} UTC"
+        except Exception:
+            pass
+
+    # When "Time: 21:40 UTC" is present but no explicit timeframe in text, default to +5 min.
+    if time_utc_display is not None and timeframe is None:
+        timeframe = "5m"
+
+    # Skip non-actionable chatter (need at least side, and either timeframe or explicit signal time).
+    if not side:
+        return None
+    if not timeframe and not time_utc_display:
         return None
 
     direction = "UP" if side == "YES" else "DOWN" if side == "NO" else None
@@ -198,7 +222,7 @@ def parse_signal_from_text(text: str) -> dict[str, Any] | None:
         except Exception:
             confidence_pct = None
 
-    return {
+    out: dict[str, Any] = {
         "asset": asset,
         "timeframe": timeframe,
         "market": market,
@@ -206,9 +230,17 @@ def parse_signal_from_text(text: str) -> dict[str, Any] | None:
         "direction": direction,
         "confidence_pct": confidence_pct,
     }
+    if time_utc_display is not None:
+        out["time_utc_display"] = time_utc_display
+        out["time_utc_hour"] = time_utc_hour
+        out["time_utc_min"] = time_utc_min
+    return out
 
 
-async def run_listener(cfg: ListenerConfig) -> None:
+async def run_listener(
+    cfg: ListenerConfig,
+    on_signal: Callable[[dict[str, Any]], None] | None = None,
+) -> None:
     seen_keys = _load_seen_message_keys(cfg.output_path)
     print(f"[listener] loaded {len(seen_keys)} existing message keys from {cfg.output_path}")
 
@@ -256,11 +288,39 @@ async def run_listener(cfg: ListenerConfig) -> None:
             return
 
         msg_date = getattr(msg, "date", None)
+        # Prefer "Time: 21:40 UTC" from message for signal_ts when present.
         signal_ts = int(msg_date.timestamp()) if msg_date else int(time.time())
-        try:
-            signal_at = msg_date.isoformat() if msg_date else None
-        except Exception:
-            signal_at = None
+        signal_at: str | None = None
+        time_utc_hour = parsed.get("time_utc_hour")
+        time_utc_min = parsed.get("time_utc_min")
+        if time_utc_hour is not None and time_utc_min is not None:
+            try:
+                if msg_date:
+                    if getattr(msg_date, "tzinfo", None) is not None:
+                        base = msg_date.astimezone(timezone.utc)
+                    else:
+                        base = msg_date.replace(tzinfo=timezone.utc)
+                    day = base.date()
+                else:
+                    day = datetime.now(timezone.utc).date()
+                dt_utc = datetime(
+                    day.year, day.month, day.day,
+                    time_utc_hour, time_utc_min, 0, 0,
+                    tzinfo=timezone.utc,
+                )
+                signal_ts = int(dt_utc.timestamp())
+                signal_at = dt_utc.isoformat()
+            except Exception:
+                if msg_date:
+                    try:
+                        signal_at = msg_date.isoformat() if msg_date else None
+                    except Exception:
+                        signal_at = None
+        else:
+            try:
+                signal_at = msg_date.isoformat() if msg_date else None
+            except Exception:
+                signal_at = None
 
         # Market end = signal arrival + timeframe (place trade before this).
         tf = parsed.get("timeframe")
@@ -279,6 +339,7 @@ async def run_listener(cfg: ListenerConfig) -> None:
             "message_date": str(msg_date),
             "signal_ts": signal_ts,
             "signal_at": signal_at,
+            "time_utc_display": parsed.get("time_utc_display"),  # e.g. "21:40 UTC"
             "market_end_ts": market_end_ts,
             "market_end_at": market_end_at,
             "sender_id": getattr(msg, "sender_id", None),
@@ -287,6 +348,11 @@ async def run_listener(cfg: ListenerConfig) -> None:
             **parsed,
         }
         _append_jsonl(cfg.output_path, payload)
+        if on_signal:
+            try:
+                on_signal(payload)
+            except Exception:
+                pass
         seen_keys.add(key)
         out = {**parsed, "signal_ts": signal_ts, "signal_at": signal_at, "market_end_ts": market_end_ts, "market_end_at": market_end_at}
         print(f"[listener] {source} signal: {json.dumps(out, ensure_ascii=False)}")

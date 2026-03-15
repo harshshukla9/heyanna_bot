@@ -410,7 +410,27 @@ class DatabaseManager:
                 conn.execute("ALTER TABLE copy_trading_hooks ADD COLUMN enabled INTEGER NOT NULL DEFAULT 0;")
             except sqlite3.OperationalError:
                 pass
-            # Hook execution log table
+            # Global copy hooks: follow by wallet address (leader_address), not leader_user_id.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS copy_hooks (
+                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                    follower_user_id  INTEGER NOT NULL,
+                    leader_address    TEXT NOT NULL,
+                    config            TEXT,
+                    enabled           INTEGER NOT NULL DEFAULT 1,
+                    last_seen_ts      INTEGER NOT NULL DEFAULT 0,
+                    created_at        INTEGER NOT NULL,
+                    UNIQUE (follower_user_id, leader_address),
+                    FOREIGN KEY (follower_user_id) REFERENCES users(user_id)
+                );
+                """
+            )
+            try:
+                conn.execute("ALTER TABLE copy_hooks ADD COLUMN last_seen_ts INTEGER NOT NULL DEFAULT 0;")
+            except sqlite3.OperationalError:
+                pass
+            # Hook execution log table (hook_id may be from copy_trading_hooks or copy_hooks — no FK on hook_id).
             try:
                 conn.execute(
                     """
@@ -430,11 +450,66 @@ class DatabaseManager:
                         status            TEXT NOT NULL,
                         error_message     TEXT,
                         executed_at       INTEGER NOT NULL,
-                        FOREIGN KEY (hook_id) REFERENCES copy_trading_hooks(id),
                         FOREIGN KEY (follower_user_id) REFERENCES users(user_id)
                     );
                     """
                 )
+            except sqlite3.OperationalError:
+                pass
+
+            # copy_logs: execution log for global copy hooks (used by copy_trading.py and /me/copy-trading/notifications).
+            # Same schema as copy_trading module; no FK on hook_id so copy_hooks ids are valid.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS copy_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    hook_id INTEGER NOT NULL,
+                    follower_user_id INTEGER NOT NULL,
+                    leader_address TEXT,
+                    trade_side TEXT,
+                    trade_outcome TEXT,
+                    trade_amount REAL,
+                    trade_price REAL,
+                    trade_size REAL,
+                    follower_amount REAL,
+                    condition_id TEXT,
+                    status TEXT NOT NULL,
+                    error TEXT,
+                    executed_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+                );
+                """
+            )
+
+            # Migration: recreate hook_logs without hook_id FK (so copy_hooks ids can be logged).
+            try:
+                if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='hook_logs'").fetchone():
+                    conn.execute(
+                        """
+                        CREATE TABLE hook_logs_new (
+                            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                            hook_id           INTEGER NOT NULL,
+                            follower_user_id  INTEGER NOT NULL,
+                            leader_address    TEXT,
+                            trade_side        TEXT,
+                            trade_outcome     TEXT,
+                            trade_amount      REAL,
+                            trade_price       REAL,
+                            trade_size        REAL,
+                            follower_amount   REAL,
+                            condition_id      TEXT,
+                            market_title      TEXT,
+                            status            TEXT NOT NULL,
+                            error_message     TEXT,
+                            executed_at       INTEGER NOT NULL,
+                            FOREIGN KEY (follower_user_id) REFERENCES users(user_id)
+                        );
+                        """
+                    )
+                    conn.execute(
+                        "INSERT INTO hook_logs_new SELECT id, hook_id, follower_user_id, leader_address, trade_side, trade_outcome, trade_amount, trade_price, trade_size, follower_amount, condition_id, market_title, status, error_message, executed_at FROM hook_logs;"
+                    )
+                    conn.execute("DROP TABLE hook_logs;")
+                    conn.execute("ALTER TABLE hook_logs_new RENAME TO hook_logs;")
             except sqlite3.OperationalError:
                 pass
 
@@ -537,6 +612,10 @@ class DatabaseManager:
                     self._encrypt_secret(sol_private_key),
                 ),
             )
+        # Auto-create Polymarket profile with Telegram username so leader/follower displays show it.
+        eth_addr = (eth_data.get("address") or "").strip()
+        if eth_addr:
+            self.upsert_polymarket_profile(eth_addr, username)
 
     def update_safe_address(self, eth_address: str, safe_address: str) -> None:
         """Persist the Safe / proxy wallet address for a user."""
@@ -719,6 +798,24 @@ class DatabaseManager:
         leader_address = leader_address.lower().strip()
 
         with self.transaction() as conn:
+            # Get hook id(s) for this follower+leader so we can clear dependent rows first.
+            rows = conn.execute(
+                "SELECT id FROM copy_hooks WHERE follower_user_id = ? AND leader_address = ?;",
+                (follower_user_id, leader_address),
+            ).fetchall()
+            hook_ids = [r["id"] for r in rows] if rows else []
+            if not hook_ids:
+                return False
+            # Remove dependent rows (copy_logs/hook_logs may have FK to copy_hooks).
+            for hook_id in hook_ids:
+                try:
+                    conn.execute("DELETE FROM copy_logs WHERE hook_id = ?;", (hook_id,))
+                except sqlite3.OperationalError:
+                    pass
+                try:
+                    conn.execute("DELETE FROM hook_logs WHERE hook_id = ?;", (hook_id,))
+                except sqlite3.OperationalError:
+                    pass
             cur = conn.execute(
                 """
                 DELETE FROM copy_hooks

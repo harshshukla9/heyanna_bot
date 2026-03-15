@@ -1,6 +1,11 @@
 {
   "version": 1,
   "skills": {
+    "polymarket-api": {
+      "source": "agentmc15/polymarket-trader",
+      "sourceType": "github",
+      "computedHash": "022fdd5e3e1b283110f08f8b3234f4f7cf221e38f3cf174c54ec962a0e3bed67"
+    },
     "telegram-bot-builder": {
       "source": "sickn33/antigravity-awesome-skills",
       "sourceType": "github",

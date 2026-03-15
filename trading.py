@@ -1,3 +1,4 @@
+import json
 import logging
 import time
 from typing import Union
@@ -8,10 +9,48 @@ from py_clob_client.exceptions import PolyApiException
 
 from database_manager import DatabaseManager
 import market_cache
-from bot_tools import approve_usdc_for_trading, get_trading_wallet_address
+from bot_tools import (
+    approve_usdc_for_trading,
+    get_trading_wallet_address,
+    get_usdc_e_balance_on_polygon,
+)
 
 
 logger = logging.getLogger(__name__)
+
+
+def _log_clob_error(
+    e: PolyApiException,
+    context: str,
+    user_id: int | None = None,
+    request_ctx: dict | None = None,
+) -> None:
+    """Log CLOB API error with status code, response body, and request context for debugging 400s."""
+    status_code = getattr(e, "status_code", None)
+    err_body = getattr(e, "error_message", None)
+    try:
+        body_str = json.dumps(err_body, default=str) if err_body is not None else repr(err_body)
+    except Exception:
+        body_str = repr(err_body)
+    logger.error(
+        "CLOB %s: HTTP %s | user_id=%s | response=%s",
+        context,
+        status_code if status_code is not None else "?",
+        user_id,
+        body_str,
+    )
+    if request_ctx:
+        try:
+            ctx_str = json.dumps(request_ctx, default=str)
+        except Exception:
+            ctx_str = repr(request_ctx)
+        logger.error("CLOB 400 DEBUG request_ctx=%s", ctx_str)
+    if status_code == 400 and err_body:
+        err_msg = err_body.get("error", str(err_body)) if isinstance(err_body, dict) else str(err_body)
+        logger.error(
+            "CLOB HTTP 400: %s | Check: balance/allowance for trading wallet, funder=Safe for sells, token_id/amount valid.",
+            err_msg,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -19,23 +58,19 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _create_clob_client(private_key: str, use_safe: bool, trading_addr: str) -> ClobClient:
-    """Create an authenticated ClobClient with derived API credentials."""
-    l1 = ClobClient(
+    """
+    Create an authenticated ClobClient per Polymarket skill: one client with funder,
+    derive creds on it, then set_api_creds so creds are bound to that funder (Safe).
+    """
+    client = ClobClient(
         host="https://clob.polymarket.com",
         chain_id=137,
         key=private_key,
         signature_type=2 if use_safe else 0,
         funder=trading_addr if use_safe else None,
     )
-    creds = l1.create_or_derive_api_creds()
-    return ClobClient(
-        host="https://clob.polymarket.com",
-        chain_id=137,
-        key=private_key,
-        creds=creds,
-        signature_type=2 if use_safe else 0,
-        funder=trading_addr if use_safe else None,
-    )
+    client.set_api_creds(client.create_or_derive_api_creds())
+    return client
 
 
 def _is_allowance_error(exc: PolyApiException) -> bool:
@@ -95,10 +130,13 @@ def execute_trade_for_user(
     condition_id: str,
     order_side: str = "BUY",
     copied_from_user_id: int | None = None,
+    token_id: str | None = None,
+    outcome_index: int | None = None,
 ) -> str:
     """
-    Execute a trade for a user. side = outcome (Yes/No), order_side = BUY or SELL.
-    Use order_side=SELL to close a position (sell the outcome you hold).
+    Execute a trade for a user. side = outcome (e.g. Yes/No, NSH, Under).
+    Use order_side=SELL to close a position. Resolves generic labels (Yes/Under) to
+    market's actual outcome name (e.g. NSH) when token_id or outcome_index is provided (copy-trade).
     """
     # Resolve market from cache, or fetch by condition_id from CLOB and add to cache
     market_cache.ensure_market_cached(condition_id)
@@ -109,9 +147,57 @@ def execute_trade_for_user(
             "Call /markets/trending or /markets/search first to load markets."
         )
 
-    side_clean = side.strip().capitalize()
-    if side_clean not in m.outcomes:
-        return f"Invalid side '{side}'. Available outcomes: {', '.join(m.outcomes)}"
+    # Resolve to market's actual outcome name (e.g. NSH not Yes/Under) for copy-trade
+    side_raw = (side or "").strip()
+    side_clean = None
+    if token_id and m.clob_token_ids:
+        try:
+            tid = str(token_id).strip()
+            idx = m.clob_token_ids.index(tid)
+            if 0 <= idx < len(m.outcomes):
+                side_clean = m.outcomes[idx]
+        except (ValueError, AttributeError):
+            pass
+    if side_clean is None and outcome_index is not None and m.outcomes:
+        try:
+            i = int(outcome_index)
+            if 0 <= i < len(m.outcomes):
+                side_clean = m.outcomes[i]
+        except (TypeError, ValueError):
+            pass
+    if side_clean is None and len(m.outcomes) >= 2:
+        low = side_raw.lower()
+        if low in ("yes", "1", "long"):
+            side_clean = m.outcomes[0]
+        elif low in ("no", "0", "short"):
+            side_clean = m.outcomes[1]
+    if side_clean is None:
+        side_lower = side_raw.lower()
+        side_clean = next((o for o in m.outcomes if o.lower() == side_lower), None)
+    if not side_clean:
+        market_cache.clear_by_condition_id(condition_id)
+        market_cache.ensure_market_cached(condition_id)
+        m = market_cache.get_by_condition_id(condition_id)
+        if m:
+            if token_id and m.clob_token_ids:
+                try:
+                    idx = m.clob_token_ids.index(str(token_id).strip())
+                    if 0 <= idx < len(m.outcomes):
+                        side_clean = m.outcomes[idx]
+                except (ValueError, AttributeError):
+                    pass
+            if side_clean is None and outcome_index is not None:
+                try:
+                    i = int(outcome_index)
+                    if 0 <= i < len(m.outcomes):
+                        side_clean = m.outcomes[i]
+                except (TypeError, ValueError):
+                    pass
+            if side_clean is None:
+                side_lower = side_raw.lower()
+                side_clean = next((o for o in m.outcomes if o.lower() == side_lower), None)
+        if not side_clean or not m:
+            return f"Invalid side '{side}'. Available outcomes: {', '.join(m.outcomes) if m else 'unknown'}"
 
     # 2. Resolve the CLOB token ID for the chosen side
     side_idx = m.outcomes.index(side_clean)
@@ -163,12 +249,36 @@ def execute_trade_for_user(
             break  # success
 
         except PolyApiException as e:
+            _log_clob_error(
+                e,
+                "post_order (market)",
+                user_id=user_id,
+                request_ctx={
+                    "token_id": token_id,
+                    "amount": amount_value,
+                    "side": side_clean,
+                    "order_side": order_side_clean,
+                    "trading_addr": trading_addr,
+                    "use_safe": use_safe,
+                    "condition_id": m.condition_id[:20] + "..." if m.condition_id else None,
+                },
+            )
             if attempt == 0 and _is_allowance_error(e):
-                logger.warning(
-                    "Trade attempt 1 failed with allowance error for user %s; "
-                    "forcing gasless re-approval and retrying...", user_id,
-                )
+                try:
+                    usdc_bal = get_usdc_e_balance_on_polygon(trading_addr)
+                    logger.warning(
+                        "Trade attempt 1 failed with allowance error for user %s; "
+                        "trading_addr=%s USDC.e_balance=%.4f; forcing gasless re-approval and retrying...",
+                        user_id, trading_addr, usdc_bal if usdc_bal is not None else 0.0,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Trade attempt 1 failed with allowance error for user %s; "
+                        "trading_addr=%s; forcing gasless re-approval and retrying...",
+                        user_id, trading_addr,
+                    )
                 _force_reapprove(db, user_id, owner_addr)
+                time.sleep(5)  # allow approval tx to be mined before retry
                 continue
 
             err = getattr(e, "error_message", {}) or {}
@@ -274,8 +384,10 @@ def execute_limit_order_for_user(
             "Call /markets/trending or /markets/search first to load markets."
         )
 
-    side_clean = side.strip().capitalize()
-    if side_clean not in m.outcomes:
+    side_raw = (side or "").strip()
+    side_lower = side_raw.lower()
+    side_clean = next((o for o in m.outcomes if o.lower() == side_lower), None)
+    if not side_clean:
         return f"Invalid side '{side}'. Available outcomes: {', '.join(m.outcomes)}"
 
     try:
@@ -331,12 +443,37 @@ def execute_limit_order_for_user(
             break
 
         except PolyApiException as e:
+            _log_clob_error(
+                e,
+                "post_order (limit)",
+                user_id=user_id,
+                request_ctx={
+                    "token_id": token_id,
+                    "price": price_val,
+                    "size": size_val,
+                    "side": side_clean,
+                    "order_side": order_side_clean,
+                    "trading_addr": trading_addr,
+                    "use_safe": use_safe,
+                    "condition_id": m.condition_id[:20] + "..." if m.condition_id else None,
+                },
+            )
             if attempt == 0 and _is_allowance_error(e):
-                logger.warning(
-                    "Limit order attempt 1 failed with allowance error for user %s; "
-                    "forcing gasless re-approval and retrying...", user_id,
-                )
+                try:
+                    usdc_bal = get_usdc_e_balance_on_polygon(trading_addr)
+                    logger.warning(
+                        "Limit order attempt 1 failed with allowance error for user %s; "
+                        "trading_addr=%s USDC.e_balance=%.4f; forcing gasless re-approval and retrying...",
+                        user_id, trading_addr, usdc_bal if usdc_bal is not None else 0.0,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Limit order attempt 1 failed with allowance error for user %s; "
+                        "trading_addr=%s; forcing gasless re-approval and retrying...",
+                        user_id, trading_addr,
+                    )
                 _force_reapprove(db, user_id, owner_addr)
+                time.sleep(5)  # allow approval tx to be mined before retry
                 continue
 
             err = getattr(e, "error_message", {}) or {}

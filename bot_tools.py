@@ -279,13 +279,48 @@ def get_polygon_balance_json(address: str) -> dict:
         }
     return data
 
-# Polymarket contract addresses on Polygon (from official gist)
+
+def get_usdc_e_balance_on_polygon(address: str) -> float | None:
+    """
+    Return USDC.e (0x2791...) balance for an address on Polygon in human units.
+    Returns None on RPC/contract error.
+    """
+    if not address or not address.strip().startswith("0x"):
+        return None
+    try:
+        from web3 import Web3
+        rpc = os.getenv("POLYGON_RPC_URL") or "https://polygon-rpc.com"
+        w3 = Web3(Web3.HTTPProvider(rpc))
+        checksum = Web3.to_checksum_address(address)
+        usdc_addr = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+        abi = json.loads('[{"constant":true,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}]')
+        contract = w3.eth.contract(address=usdc_addr, abi=abi)
+        raw = contract.functions.balanceOf(checksum).call()
+        return float(raw) / 1e6
+    except Exception as e:
+        logging.debug("get_usdc_e_balance_on_polygon failed for %s: %s", address[:20], e)
+        return None
+
+
+# Polymarket contract addresses on Polygon (from official docs + deployment resources)
 USDC_POLYGON = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 EXCHANGE_ADDRESS = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 NEG_RISK_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
 NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+NEG_RISK_OPERATOR = "0x71523d0f655B41E805Cec45b17163f528B59B820"
+NEG_RISK_FEE_MODULE = "0x78769D50Be1763ed1CA0D5E878D93f05aabff29e"
 MAX_APPROVAL = 2**256 - 1
+
+# All 6 contracts that need approval (USDC spenders + CTF operators)
+POLYMARKET_APPROVAL_CONTRACTS = [
+    CTF_ADDRESS,
+    NEG_RISK_ADAPTER,
+    EXCHANGE_ADDRESS,
+    NEG_RISK_EXCHANGE,
+    NEG_RISK_OPERATOR,
+    NEG_RISK_FEE_MODULE,
+]
 
 ERC20_APPROVE_ABI = json.loads('[{"constant":false,"inputs":[{"name":"_spender","type":"address"},{"name":"_value","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"}]')
 ERC20_TRANSFER_ABI = json.loads('[{"constant":false,"inputs":[{"name":"_to","type":"address"},{"name":"_value","type":"uint256"}],"name":"transfer","outputs":[{"name":"","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"}]')
@@ -765,11 +800,45 @@ def _run_gasless_approve(user_id: int, address: str) -> bool:
         return False
 
 
+def _log_clob_error(
+    e: Exception,
+    context: str,
+    address: str | None = None,
+    request_ctx: dict | None = None,
+) -> None:
+    """Log CLOB API error with status code, response body, and request context for debugging 400s."""
+    status_code = getattr(e, "status_code", None)
+    err_body = getattr(e, "error_message", None)
+    try:
+        body_str = json.dumps(err_body, default=str) if err_body is not None else repr(err_body)
+    except Exception:
+        body_str = repr(err_body)
+    logging.error(
+        "CLOB %s: HTTP %s | address=%s | response=%s",
+        context,
+        status_code if status_code is not None else "?",
+        address or "?",
+        body_str,
+    )
+    if request_ctx:
+        try:
+            ctx_str = json.dumps(request_ctx, default=str)
+        except Exception:
+            ctx_str = repr(request_ctx)
+        logging.error("CLOB 400 DEBUG request_ctx=%s", ctx_str)
+    if status_code == 400 and err_body:
+        err_msg = err_body.get("error", str(err_body)) if isinstance(err_body, dict) else str(err_body)
+        logging.error(
+            "CLOB HTTP 400: %s | Check: balance/allowance for trading wallet, funder=Safe for sells, token_id/amount valid.",
+            err_msg,
+        )
+
+
 @mcp.tool()
 def approve_usdc_for_trading(address: str) -> str:
     """
     Set all USDC + CTF allowances for Polymarket trading using the gasless
-    Builder relayer (6 logical operations batched via relay).
+    Builder relayer. Approves all 6 Polymarket contracts (USDC spend + CTF operator).
     Must be called once before the first trade.
     """
     db_user = db.get_user_by_address(address)
@@ -786,24 +855,11 @@ def approve_usdc_for_trading(address: str) -> str:
     usdc = w3.eth.contract(address=Web3.to_checksum_address(USDC_POLYGON), abi=ERC20_APPROVE_ABI)
     ctf = w3.eth.contract(address=Web3.to_checksum_address(CTF_ADDRESS), abi=ERC1155_APPROVAL_ABI)
 
-    # Safe approval pattern, matching Polymarket's Safe demo:
-    # 1) USDC.approve(spender, MAX_UINT256) for all contracts that pull collateral:
-    #    - CTF (splitting collateral into outcome tokens)
-    #    - NEG_RISK_ADAPTER (neg-risk collateral)
-    #    - EXCHANGE_ADDRESS (standard market orders)
-    #    - NEG_RISK_EXCHANGE (neg-risk market orders)
-    # 2) CTF.setApprovalForAll(exchange-like contracts, true) so they can move ERC-1155 positions.
-
+    # 1) USDC.approve(spender, MAX_UINT256) for all 6 contracts that pull collateral.
+    # 2) CTF.setApprovalForAll(operator, true) for all 6 so they can move ERC-1155 positions.
     txs: list[_RelayTx] = []
 
-    # USDC.e → approvals for all contracts that ever pull collateral.
-    usdc_spenders = [
-        CTF_ADDRESS,        # splitting collateral into outcome tokens
-        NEG_RISK_ADAPTER,   # neg-risk market collateral
-        EXCHANGE_ADDRESS,   # standard market orders
-        NEG_RISK_EXCHANGE,  # neg-risk market orders
-    ]
-    for spender in usdc_spenders:
+    for spender in POLYMARKET_APPROVAL_CONTRACTS:
         spender_addr = Web3.to_checksum_address(spender)
         approve_data = usdc.encode_abi("approve", args=[spender_addr, MAX_APPROVAL])
         txs.append(
@@ -814,15 +870,9 @@ def approve_usdc_for_trading(address: str) -> str:
             )
         )
 
-    # CTF setApprovalForAll for the various exchange contracts that move positions.
-    ctf_spenders = [
-        EXCHANGE_ADDRESS,
-        NEG_RISK_EXCHANGE,
-        NEG_RISK_ADAPTER,
-    ]
-    for spender in ctf_spenders:
-        spender_addr = Web3.to_checksum_address(spender)
-        set_approval_data = ctf.encode_abi("setApprovalForAll", args=[spender_addr, True])
+    for operator in POLYMARKET_APPROVAL_CONTRACTS:
+        operator_addr = Web3.to_checksum_address(operator)
+        set_approval_data = ctf.encode_abi("setApprovalForAll", args=[operator_addr, True])
         txs.append(
             _RelayTx(
                 to=CTF_ADDRESS,
@@ -976,14 +1026,45 @@ def get_polymarket_portfolio_with_positions(address: str) -> tuple[str, list[dic
         portfolio_value = 0.0
         for p in positions:
             title = p.get("title", "Unknown Market")
-            outcome = p.get("outcome", "Unknown")
+            api_outcome = p.get("outcome", "Unknown")
             condition_id = p.get("conditionId") or p.get("condition_id") or ""
+            asset = p.get("asset") or p.get("token_id") or ""
+            outcome_index = p.get("outcomeIndex")
             size = float(p.get("size", 0))
             avg_price = float(p.get("avgPrice", 0))
             cur_price = float(p.get("curPrice", 0))
             cur_val = float(p.get("currentValue", 0))
             pnl_pct = float(p.get("percentPnl", 0))
             pnl_emoji = "🟢" if pnl_pct >= 0 else "🔴"
+            # Resolve to market's actual outcome name (e.g. NSH not Yes/Under) so sell uses correct token
+            outcome = api_outcome
+            if condition_id:
+                m = market_cache.ensure_market_cached(condition_id)
+                if m and m.outcomes:
+                    if asset:
+                        try:
+                            idx = m.clob_token_ids.index(str(asset).strip())
+                            if 0 <= idx < len(m.outcomes):
+                                outcome = m.outcomes[idx]
+                        except (ValueError, AttributeError):
+                            pass
+                    if outcome == api_outcome and outcome_index is not None:
+                        try:
+                            i = int(outcome_index)
+                            if 0 <= i < len(m.outcomes):
+                                outcome = m.outcomes[i]
+                        except (TypeError, ValueError):
+                            pass
+                    if outcome == api_outcome and len(m.outcomes) >= 2:
+                        low = api_outcome.strip().lower()
+                        if low in ("yes", "1", "long"):
+                            outcome = m.outcomes[0]
+                        elif low in ("no", "0", "short"):
+                            outcome = m.outcomes[1]
+                    if outcome == api_outcome:
+                        matched = next((o for o in m.outcomes if o.lower() == (api_outcome or "").lower()), None)
+                        if matched:
+                            outcome = matched
             lines.append(
                 f"• **{title}**\n"
                 f"  Side: {outcome} | Size: {size:.2f} shares\n"
@@ -1613,17 +1694,13 @@ def execute_trade(market_id: int, side: str, amount: str, address: str) -> str:
 
     for attempt in range(2):
         try:
-            l1 = ClobClient(
+            # Per Polymarket skill: one client with funder, set_api_creds(create_or_derive_api_creds())
+            client = ClobClient(
                 host="https://clob.polymarket.com", chain_id=137, key=private_key,
                 signature_type=2 if use_safe else 0,
                 funder=trading_addr if use_safe else None,
             )
-            creds = l1.create_or_derive_api_creds()
-            client = ClobClient(
-                host="https://clob.polymarket.com", chain_id=137, key=private_key,
-                creds=creds, signature_type=2 if use_safe else 0,
-                funder=trading_addr if use_safe else None,
-            )
+            client.set_api_creds(client.create_or_derive_api_creds())
             order_args = MarketOrderArgs(token_id=token_id, amount=amount_float, side="BUY")
             signed_order = client.create_market_order(order_args)
             resp = client.post_order(signed_order, orderType=OrderType.FOK)
@@ -1653,6 +1730,20 @@ def execute_trade(market_id: int, side: str, amount: str, address: str) -> str:
             )
 
         except PolyApiException as e:
+            _log_clob_error(
+                e,
+                "post_order (market)",
+                address=address,
+                request_ctx={
+                    "token_id": token_id,
+                    "amount": amount_float,
+                    "side": side,
+                    "order_side": "BUY",
+                    "trading_addr": trading_addr,
+                    "use_safe": use_safe,
+                    "market_id": market_id,
+                },
+            )
             err = getattr(e, "error_message", {}) or {}
             msg = (err.get("error") or str(e)).lower()
             if attempt == 0 and ("allowance" in msg or "not enough balance" in msg):
@@ -1686,9 +1777,15 @@ def execute_sell_position(market_id: int, outcome: str, shares: float, address: 
     m = market_cache.get(market_id)
     if not m:
         return f"Market #{market_id} not found in cache."
-    outcome = outcome.strip().capitalize()
-    if outcome not in m.outcomes:
-        return f"Invalid outcome '{outcome}'."
+    raw = outcome.strip()
+    if not raw:
+        return "Invalid outcome (empty)."
+    # Match outcome case-insensitively so "yes"/"Yes"/"YES" and any other outcome key work.
+    outcome_lower = raw.lower()
+    matched = next((o for o in m.outcomes if o.lower() == outcome_lower), None)
+    if not matched:
+        return f"Invalid outcome '{raw}'. Available: {', '.join(m.outcomes)}."
+    outcome = matched
     try:
         shares_float = float(shares)
     except (ValueError, TypeError):
@@ -1713,17 +1810,19 @@ def execute_sell_position(market_id: int, outcome: str, shares: float, address: 
 
     for attempt in range(2):
         try:
-            l1 = ClobClient(
-                host="https://clob.polymarket.com", chain_id=137, key=private_key,
-                signature_type=2 if use_safe else 0,
-                funder=trading_addr if use_safe else None,
+            # CLOB attributes orders to funder (Safe); must match wallet that holds the position.
+            funder = trading_addr if use_safe else None
+            logging.info(
+                "Sell order: trading_addr=%s use_safe=%s token_id=%s amount=%.4f funder=%s",
+                trading_addr, use_safe, token_id, shares_float, funder or "(EOA)",
             )
-            creds = l1.create_or_derive_api_creds()
+            # Per Polymarket skill: one client with funder, set_api_creds(create_or_derive_api_creds())
             client = ClobClient(
                 host="https://clob.polymarket.com", chain_id=137, key=private_key,
-                creds=creds, signature_type=2 if use_safe else 0,
-                funder=trading_addr if use_safe else None,
+                signature_type=2 if use_safe else 0,
+                funder=funder,
             )
+            client.set_api_creds(client.create_or_derive_api_creds())
             order_args = MarketOrderArgs(token_id=token_id, amount=shares_float, side="SELL")
             signed_order = client.create_market_order(order_args)
             resp = client.post_order(signed_order, orderType=OrderType.FOK)
@@ -1747,11 +1846,30 @@ def execute_sell_position(market_id: int, outcome: str, shares: float, address: 
             )
 
         except PolyApiException as e:
+            _log_clob_error(
+                e,
+                "post_order (sell)",
+                address=address,
+                request_ctx={
+                    "token_id": token_id,
+                    "amount_shares": shares_float,
+                    "outcome": outcome,
+                    "order_side": "SELL",
+                    "trading_addr": trading_addr,
+                    "use_safe": use_safe,
+                    "funder": funder or "(EOA)",
+                    "market_id": market_id,
+                },
+            )
             err = getattr(e, "error_message", {}) or {}
             msg = (err.get("error") or str(e)).lower()
             if attempt == 0 and ("allowance" in msg or "not enough balance" in msg):
-                logging.warning("Sell failed with allowance error; forcing re-approval for %s", address)
+                logging.warning(
+                    "Sell failed with allowance error for trading_addr=%s; forcing re-approval and retrying...",
+                    trading_addr,
+                )
                 _run_gasless_approve(user_id, address)
+                time.sleep(5)  # allow approval tx to be mined before retry
                 continue
             logging.error("Sell execution failed: %s", msg)
             return "❌ SELL FAILED: not enough balance or allowance."

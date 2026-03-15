@@ -485,6 +485,9 @@ class CopyTracker:
 
         condition_id = trade.get("conditionId") or trade.get("asset")
         outcome = trade.get("outcome")
+        # Token ID / outcome index let trading resolve to market's outcome name (e.g. NSH not Yes/Under)
+        token_id = trade.get("tokenID") or trade.get("token_id")
+        outcome_index = trade.get("outcomeIndex")
         market_title = trade.get("title", "")
 
         if not condition_id or not outcome:
@@ -584,7 +587,9 @@ class CopyTracker:
                             condition_id=condition_id,
                             order_side=order_side,
                             copied_from_address=proxy_wallet,
-                            hook_id=hook.hook_id
+                            hook_id=hook.hook_id,
+                            token_id=token_id,
+                            outcome_index=outcome_index,
                         )
 
                     # Update log status to success

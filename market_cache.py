@@ -90,6 +90,15 @@ def get_by_condition_id(condition_id: str) -> CachedMarket | None:
     return _by_condition.get(condition_id) if condition_id else None
 
 
+def clear_by_condition_id(condition_id: str) -> None:
+    """Remove a single market from cache by condition_id (e.g. to force re-fetch with fresh outcomes)."""
+    if not condition_id:
+        return
+    m = _by_condition.pop(condition_id, None)
+    if m is not None:
+        _cache.pop(m.market_id, None)
+
+
 def ensure_market_cached(condition_id: str) -> CachedMarket | None:
     """
     If the market is already in cache, return it. Otherwise fetch from Polymarket CLOB
@@ -108,11 +117,17 @@ def ensure_market_cached(condition_id: str) -> CachedMarket | None:
         tokens = raw.get("tokens") or []
         if len(tokens) < 2:
             return None
-        outcomes = [t.get("outcome") or "Yes" if i == 0 else "No" for i, t in enumerate(tokens)]
+        # Use each token's outcome string when present (supports Jazz/Kings, etc.); only default to Yes/No when missing.
+        def _outcome(t: dict, i: int) -> str:
+            o = t.get("outcome")
+            if o is not None and str(o).strip():
+                return str(o).strip()
+            return "Yes" if i == 0 else "No"
+        outcomes = [_outcome(t, i) for i, t in enumerate(tokens)]
         clob_token_ids = [str(t.get("token_id", "")) for t in tokens]
         odds = {}
-        for t in tokens:
-            o = t.get("outcome") or ("Yes" if t == tokens[0] else "No")
+        for i, t in enumerate(tokens):
+            o = _outcome(t, i)
             p = float(t.get("price") or 0)
             odds[o] = int(round(p * 100))
         question = raw.get("question") or "Unknown"
