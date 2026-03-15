@@ -6,7 +6,7 @@ import re
 import time
 from typing import Dict, List
 
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update, ReplyKeyboardMarkup
+from telegram import Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update, ReplyKeyboardMarkup, User
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
 
 from api_app import strip_emoji
@@ -162,7 +162,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 BOT_COMMANDS = [
     BotCommand("start", "Initialize wallet & show menu"),
     BotCommand("wallet", "Show your Polygon wallet address"),
-    BotCommand("balance", "Check token balances (Covalent)"),
+    BotCommand("balance", "Check token balances"),
     BotCommand("portfolio", "Funds + open positions & PnL"),
     BotCommand("copy", "Manage copy trading & smart wallets"),
     BotCommand("markets", "Browse trending Polymarket events"),
@@ -649,7 +649,7 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         user = update.effective_user
         db_user = db.get_user(user.id)
 
-        # Handle deep link arguments: e.g., /start trade_CONDITIONID_Yes
+        # Handle deep link arguments: e.g., /start trade_CONDITIONID_Yes or /start invite_CODE
         args = context.args
         if args and len(args) > 0:
             deep_link = args[0]
@@ -669,7 +669,19 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                     context.user_data["awaiting_follow_risk"] = True
                     await _send_follow_risk_menu(update.message, wallet)
                     return
+            if deep_link.startswith("invite_"):
+                # Parse: invite_CODE - handle invite code redemption
+                invite_code = deep_link[7:].strip().upper()
+                if not db_user:
+                    # User doesn't exist yet, create and onboard
+                    await _handle_new_user_with_invite(update, context, invite_code, user)
+                    return
+                else:
+                    # Existing user trying to use invite code
+                    await _handle_existing_user_with_invite(update, context, invite_code, db_user)
+                    return
 
+        # Create user if doesn't exist
         if not db_user:
             await _send_banner_with_caption(
                 context.bot,
@@ -679,7 +691,6 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             )
             eth_wallet = wallets.generate_eth_wallet()
 
-            # We store empty strings for Solana since it is disabled for now.
             db.create_user(
                 user_id=user.id,
                 username=user.username or "",
@@ -688,26 +699,208 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             )
             db_user = db.get_user(user.id)
 
+        # Check if user is onboarded
+        is_onboarded, _ = db.get_user_onboarding_status(user.id)
+        if not is_onboarded:
+            # Show invite code input button
+            button = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔑 Enter Invite Code", callback_data="enter_invite_code")
+            ]])
             await _send_banner_with_caption(
                 context.bot,
                 update.effective_chat.id,
                 WELCOME_BANNER_PATH,
-                f"Welcome, {user.first_name} — wallet created.\n\nPolygon address:\n`{db_user['eth_address']}`",
+                f"Welcome, {user.first_name}!\n\n"
+                f"🔒 Your account needs to be activated with an invite code.\n\n"
+                f"Click below to enter your invite code:",
                 parse_mode="Markdown",
-                reply_markup=MAIN_KEYBOARD,
+                reply_markup=button,
             )
-            await _send_home(update, context, db_user)
+            return
+
+        await _send_banner_with_caption(
+            context.bot,
+            update.effective_chat.id,
+            WELCOME_BANNER_PATH,
+            f"Welcome back {user.first_name}! Wallet: `{db_user['eth_address']}`\n\n"
+            f"Tap **Main Menu** below to get started.",
+            parse_mode="Markdown",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        await _send_home(update, context, db_user)
+
+    async def _handle_new_user_with_invite(update: Update, context: ContextTypes.DEFAULT_TYPE, invite_code: str, user: User):
+        """Handle new user registration with invite code."""
+        # Validate invite code
+        is_valid, message = db.validate_invite_code(invite_code)
+        if not is_valid:
+            await _send_banner_with_caption(
+                context.bot,
+                update.effective_chat.id,
+                WELCOME_BANNER_PATH,
+                f"❌ {message}\n\n"
+                "Please get a valid invite code and try again.\n\n"
+                "Use: `/join <CODE>`",
+                parse_mode="Markdown",
+            )
+            return
+
+        # Create user with onboarded status
+        await _send_banner_with_caption(
+            context.bot,
+            update.effective_chat.id,
+            WELCOME_BANNER_PATH,
+            "🔐 Validating invite code...",
+        )
+
+        eth_wallet = wallets.generate_eth_wallet()
+
+        with db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO users (
+                    user_id, username,
+                    eth_address, eth_private_key,
+                    sol_address, sol_private_key,
+                    onboarded, invite_code
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?);
+                """,
+                (
+                    user.id,
+                    user.username or "",
+                    eth_wallet["address"],
+                    db._encrypt_secret(eth_wallet["private_key"]),
+                    "",
+                    db._encrypt_secret(""),
+                    invite_code.upper(),
+                ),
+            )
+
+        db_user = db.get_user(user.id)
+
+        await _send_banner_with_caption(
+            context.bot,
+            update.effective_chat.id,
+            WELCOME_BANNER_PATH,
+            f"✅ Welcome, {user.first_name}!\n\n"
+            f"Invite code accepted. Wallet generated.\n\n"
+            f"Polygon address:\n`{db_user['eth_address']}`\n\n"
+            f"Tap **Main Menu** below to get started.",
+            parse_mode="Markdown",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        await _send_home(update, context, db_user)
+
+    async def _handle_existing_user_with_invite(update: Update, context: ContextTypes.DEFAULT_TYPE, invite_code: str, db_user: dict):
+        """Handle existing unonboarded user with invite code."""
+        # Check if already onboarded
+        is_onboarded, _ = db.get_user_onboarding_status(db_user["user_id"])
+        if is_onboarded:
+            await update.message.reply_text(
+                "You are already onboarded. Use `/menu` to access the bot.",
+                parse_mode="Markdown",
+            )
+            return
+
+        # Validate and claim invite code
+        success, message = db.claim_invite_code(invite_code, db_user["user_id"])
+        if not success:
+            await update.message.reply_text(
+                f"❌ {message}\n\nTry another invite code.",
+                parse_mode="Markdown",
+            )
+            return
+
+        await update.message.reply_text(
+            f"✅ Successfully onboarded! You can now use the bot.\n\n"
+            f"Use `/menu` to get started.",
+            parse_mode="Markdown",
+        )
+
+    async def _on_invite_code_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Callback for entering invite code."""
+        query = update.callback_query
+        await query.answer()
+
+        db_user = db.get_user(query.from_user.id)
+        if not db_user:
+            await query.edit_message_text("Please run /start first.")
+            return
+
+        # Check if already onboarded
+        is_onboarded, _ = db.get_user_onboarding_status(db_user["user_id"])
+        if is_onboarded:
+            await query.edit_message_text("You are already onboarded. Use /menu to access the bot.")
+            return
+
+        # Ask for invite code
+        button = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Cancel", callback_data="cancel_invite_code")
+        ]])
+        await query.edit_message_text(
+            "🔑 Please enter your invite code:\n\n"
+            "Type your invite code and send, or /cancel to go back.",
+            reply_markup=button,
+        )
+        context.user_data["awaiting_invite_code"] = True
+
+    async def _on_cancel_invite_code_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Callback for canceling invite code entry."""
+        query = update.callback_query
+        await query.answer()
+
+        # Clear awaiting state
+        context.user_data.pop("awaiting_invite_code", None)
+
+        # Show welcome menu without invite code button
+        await query.edit_message_text(
+            "Cancelled. Use /start to begin again."
+        )
+
+    async def _handle_invite_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle invite code text input."""
+        user = update.effective_user
+        message = update.message
+
+        # Check if user is in awaiting invite code state
+        if not context.user_data.get("awaiting_invite_code"):
+            # Not awaiting, let it pass to normal message handler
+            return await handle_message(update, context)
+
+        # Get the invite code
+        invite_code = message.text.strip()
+
+        # Validate and claim invite code
+        user_id = user.id
+        db_user = db.get_user(user_id)
+
+        if not db_user:
+            await message.reply_text("Please run /start first to set up your account.")
+            context.user_data.pop("awaiting_invite_code", None)
+            return
+
+        # Check if already onboarded
+        is_onboarded, _ = db.get_user_onboarding_status(user_id)
+        if is_onboarded:
+            await message.reply_text("You are already onboarded. Use /menu to access the bot.")
+            context.user_data.pop("awaiting_invite_code", None)
+            return
+
+        # Try to claim the invite code
+        success, msg = db.claim_invite_code(invite_code, user_id)
+        if success:
+            # Clear state
+            context.user_data.pop("awaiting_invite_code", None)
+            await message.reply_text(
+                f"✅ Successfully onboarded! You can now use the bot.\n\n"
+                f"Use `/menu` to get started.",
+                parse_mode="Markdown",
+            )
         else:
-            await _send_banner_with_caption(
-                context.bot,
-                update.effective_chat.id,
-                WELCOME_BANNER_PATH,
-                f"Welcome back {user.first_name}! Wallet: `{db_user['eth_address']}`\n\n"
-                f"Tap **Main Menu** below to get started.",
-                parse_mode="Markdown",
-                reply_markup=MAIN_KEYBOARD,
+            await message.reply_text(
+                f"❌ Invalid invite code: {msg}\n\n"
+                f"Try again or /cancel to abort."
             )
-            await _send_home(update, context, db_user)
 
     async def _initiate_trade_from_deep_link(update: Update, context: ContextTypes.DEFAULT_TYPE, identifier: str, db_user: dict | None):
         """Handle trade deep link: fetch market and show detailed trading menu."""
@@ -1227,12 +1420,35 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         context.user_data["awaiting_follow_risk"] = True
         await _send_follow_risk_menu(update.message, wallet)
 
+    async def _check_onboarding(update, context, db_user):
+        """Check if user is onboarded. Returns (is_onboarded, reply_sent). If not onboarded, sends reply and returns (False, True)."""
+        if not db_user:
+            return False, False  # User doesn't exist, let caller handle
+
+        is_onboarded, _ = db.get_user_onboarding_status(db_user["user_id"])
+        if not is_onboarded:
+            button = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔑 Enter Invite Code", callback_data="enter_invite_code")
+            ]])
+            await update.message.reply_text(
+                "🔒 Your account needs to be activated with an invite code.\n\n"
+                "Click below to enter your invite code:",
+                parse_mode="Markdown",
+                reply_markup=button,
+            )
+            return False, True
+        return True, False
+
     async def wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Formal /wallet command (delegates to unified account view)."""
         user = update.effective_user
         db_user = db.get_user(user.id)
         if not db_user:
             await update.message.reply_text("Please run /start first.")
+            return
+        # Check onboarding
+        is_onboarded, replied = await _check_onboarding(update, context, db_user)
+        if replied:
             return
         await _send_account_overview(update.effective_chat.id, context.bot, db_user)
 
@@ -1242,6 +1458,10 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         db_user = db.get_user(user.id)
         if not db_user:
             await update.message.reply_text("Please run /start first.")
+            return
+        # Check onboarding
+        is_onboarded, replied = await _check_onboarding(update, context, db_user)
+        if replied:
             return
         await _send_safe_balance(update, context, db_user)
 
@@ -1256,6 +1476,11 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         db_user = db.get_user(user.id)
         if not db_user:
             await update.message.reply_text("Please run /start first.")
+            return
+
+        # Check onboarding
+        is_onboarded, replied = await _check_onboarding(update, context, db_user)
+        if replied:
             return
 
         rows = db.execute(
@@ -1385,6 +1610,19 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         db_user = db.get_user(user.id)
         if not db_user:
             await update.message.reply_text("Please run /start first.")
+            return
+        # Check if user is onboarded
+        is_onboarded, _ = db.get_user_onboarding_status(user.id)
+        if not is_onboarded:
+            button = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔑 Enter Invite Code", callback_data="enter_invite_code")
+            ]])
+            await update.message.reply_text(
+                "🔒 Your account needs to be activated with an invite code.\n\n"
+                "Click below to enter your invite code:",
+                parse_mode="Markdown",
+                reply_markup=button,
+            )
             return
         await update.message.reply_text("🏠 Main Menu", reply_markup=MAIN_KEYBOARD)
         await _send_home(update, context, db_user)
@@ -2326,6 +2564,55 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 f"{pk}",
             )
 
+    async def join_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        /join <CODE> - Join the bot using an invite code.
+        """
+        user = update.effective_user
+        db_user = db.get_user(user.id) if user else None
+
+        args = context.args
+        if not args or len(args) == 0:
+            await update.message.reply_text(
+                "Please provide an invite code.\n\n"
+                "Usage: `/join <CODE>`\n\n"
+                "Get an invite code from an existing member.",
+                parse_mode="Markdown",
+            )
+            return
+
+        invite_code = args[0].strip().upper()
+
+        # Check if user exists
+        if not db_user:
+            # New user - create and onboard
+            await _handle_new_user_with_invite(update, context, invite_code, user)
+            return
+
+        # Check if already onboarded
+        is_onboarded, _ = db.get_user_onboarding_status(db_user["user_id"])
+        if is_onboarded:
+            await update.message.reply_text(
+                "You are already onboarded. Use `/menu` to access the bot.",
+                parse_mode="Markdown",
+            )
+            return
+
+        # Validate and claim invite code
+        success, message = db.claim_invite_code(invite_code, db_user["user_id"])
+        if not success:
+            await update.message.reply_text(
+                f"❌ {message}\n\nTry another invite code.",
+                parse_mode="Markdown",
+            )
+            return
+
+        await update.message.reply_text(
+            f"✅ Successfully onboarded! You can now use the bot.\n\n"
+            f"Use `/menu` to get started.",
+            parse_mode="Markdown",
+        )
+
     async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Task-based help menu rather than raw command list."""
         text = (
@@ -2557,6 +2844,10 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         db_user = db.get_user(user.id)
         if not db_user:
             await update.message.reply_text("Please run /start first.")
+            return
+        # Check onboarding
+        is_onboarded, replied = await _check_onboarding(update, context, db_user)
+        if replied:
             return
         await update.message.reply_text("Fetching your portfolio, balances, and open positions...")
         await _show_positions_with_close_buttons(update.effective_chat.id, context, db_user)
@@ -3584,6 +3875,7 @@ _Tap buttons below to trade or analyze._"""
     app.add_handler(CommandHandler("transfer_to_safe", transfer_to_safe_cmd))
     app.add_handler(CommandHandler("close", close_cmd))
     app.add_handler(CommandHandler("menu", menu_cmd))
+    app.add_handler(CommandHandler("join", join_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("commands", help_cmd))
 
@@ -3608,6 +3900,16 @@ _Tap buttons below to trade or analyze._"""
     # Trade handlers: support both numeric IDs and string condition IDs
     app.add_handler(CallbackQueryHandler(handle_trade_callback, pattern=r"^trade:(.+):(Yes|No)$"))
     app.add_handler(CallbackQueryHandler(handle_trade_amt_callback, pattern=r"^trade_amt:(.+):(Yes|No):[\d.]+$"))
+
+    # Invite code handlers
+    app.add_handler(CallbackQueryHandler(_on_invite_code_callback, pattern=r"^enter_invite_code$"))
+    app.add_handler(CallbackQueryHandler(_on_cancel_invite_code_callback, pattern=r"^cancel_invite_code$"))
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & (~filters.COMMAND),
+            _handle_invite_code_input,
+        )
+    )
 
     # Catch ALL non-command text messages and pipe them to the LLM
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))

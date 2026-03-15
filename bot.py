@@ -62,7 +62,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 BOT_COMMANDS = [
     BotCommand("start", "Initialize wallet & show menu"),
     BotCommand("wallet", "Show your Polygon wallet address"),
-    BotCommand("balance", "Check token balances (Covalent)"),
+    BotCommand("balance", "Check token balances"),
     BotCommand("portfolio", "Funds + open positions & PnL"),
     BotCommand("markets", "Browse trending Polymarket events"),
     BotCommand("trending", "Alias for /markets"),
@@ -231,7 +231,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "**Commands (lookups)** — Use buttons or type:\n"
         "/wallet — Your Polygon address\n"
-        "/balance — Token balances (Covalent)\n"
+        "/balance — Token balances\n"
         "/portfolio — Funds + positions & PnL\n"
         "/markets — Trending Polymarket events\n"
         "/category — Markets by category (tap to choose)\n"

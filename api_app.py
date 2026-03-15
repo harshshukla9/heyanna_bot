@@ -18,8 +18,482 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
+from fastapi.responses import StreamingResponse, HTMLResponse
+import csv
+import io
+from openpyxl import Workbook
 
 from database_manager import DatabaseManager
+
+
+# ── Admin Bearer Token ────────────────────────────────────────────────────
+ADMIN_BEARER_TOKEN = "sagar_dont_sleep"
+
+# ── Admin Dashboard HTML ──────────────────────────────────────────────────
+ADMIN_DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Dashboard - Invite Code Management</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            color: #e4e4e7;
+        }
+        .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 24px 0;
+            border-bottom: 1px solid #3f3f46;
+            margin-bottom: 32px;
+        }
+        h1 { font-size: 1.75rem; color: #fff; }
+        .card {
+            background: #18181b;
+            border: 1px solid #3f3f46;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 24px;
+        }
+        .card h2 {
+            font-size: 1.25rem;
+            margin-bottom: 16px;
+            color: #fff;
+        }
+        .form-group { margin-bottom: 16px; }
+        label { display: block; margin-bottom: 6px; font-size: 0.875rem; color: #a1a1aa; }
+        input, select {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid #3f3f46;
+            border-radius: 8px;
+            background: #27272a;
+            color: #fff;
+            font-size: 0.875rem;
+        }
+        input:focus, select:focus { outline: none; border-color: #6366f1; }
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.875rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .btn-primary { background: #6366f1; color: #fff; }
+        .btn-primary:hover { background: #4f46e5; }
+        .btn-success { background: #22c55e; color: #fff; }
+        .btn-success:hover { background: #16a34a; }
+        .btn-danger { background: #ef4444; color: #fff; }
+        .btn-danger:hover { background: #dc2626; }
+        .btn-secondary { background: #3f3f46; color: #fff; }
+        .btn-secondary:hover { background: #52525b; }
+        .btn-warning { background: #f59e0b; color: #fff; }
+        .btn-warning:hover { background: #d97706; }
+        .btn-group { display: flex; gap: 12px; flex-wrap: wrap; }
+        .actions { display: flex; gap: 8px; }
+        .actions button { padding: 6px 12px; font-size: 0.75rem; }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .stat-card {
+            background: #27272a;
+            border: 1px solid #3f3f46;
+            border-radius: 8px;
+            padding: 20px;
+            text-align: center;
+        }
+        .stat-value { font-size: 2rem; font-weight: bold; color: #6366f1; }
+        .stat-label { font-size: 0.875rem; color: #a1a1aa; margin-top: 4px; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.875rem;
+        }
+        th {
+            text-align: left;
+            padding: 12px;
+            background: #27272a;
+            color: #a1a1aa;
+            font-weight: 500;
+            border-bottom: 1px solid #3f3f46;
+        }
+        td {
+            padding: 12px;
+            border-bottom: 1px solid #3f3f46;
+        }
+        tr:hover { background: #27272a; }
+        .status-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            font-weight: 500;
+        }
+        .status-pending { background: #f59e0b33; color: #f59e0b; }
+        .status-claimed { background: #22c55e33; color: #22c55e; }
+        .status-expired { background: #ef444433; color: #ef4444; }
+        .status-inactive { background: #6366f133; color: #6366f1; }
+        .api-key-input {
+            display: flex;
+            gap: 12px;
+            align-items: flex-end;
+        }
+        .api-key-input input { flex: 1; }
+        .toast {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            padding: 12px 24px;
+            border-radius: 8px;
+            background: #27272a;
+            border: 1px solid #3f3f46;
+            z-index: 1000;
+            display: none;
+        }
+        .toast.show { display: block; }
+        .toast.success { border-color: #22c55e; }
+        .toast.error { border-color: #ef4444; }
+        .actions { display: flex; gap: 8px; }
+        .actions button { padding: 6px 12px; font-size: 0.75rem; }
+        .empty-state {
+            text-align: center;
+            padding: 48px;
+            color: #71717a;
+        }
+        .search-box {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+        .search-box input { flex: 1; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔐 Admin Dashboard</h1>
+            <div class="api-key-input">
+                <div class="form-group" style="margin-bottom:0; flex:1;">
+                    <label>Admin API Key</label>
+                    <input type="password" id="apiKey" placeholder="Enter admin key">
+                </div>
+                <button class="btn btn-primary" onclick="saveApiKey()">Save Key</button>
+            </div>
+        </header>
+
+        <div id="toast" class="toast"></div>
+
+        <div id="dashboard" style="display:none;">
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-value" id="totalCodes">0</div>
+                    <div class="stat-label">Total Codes</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="pendingCodes">0</div>
+                    <div class="stat-label">Pending</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="claimedCodes">0</div>
+                    <div class="stat-label">Claimed</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="activeCodes">0</div>
+                    <div class="stat-label">Active</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>📝 Generate Invite Code</h2>
+                <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px;">
+                    <div class="form-group">
+                        <label>Max Uses (optional)</label>
+                        <input type="number" id="maxUses" placeholder="Unlimited if empty">
+                    </div>
+                    <div class="form-group">
+                        <label>Expires In (hours)</label>
+                        <input type="number" id="expiresIn" placeholder="e.g., 168">
+                    </div>
+                    <div class="form-group">
+                        <label>Bulk Count</label>
+                        <input type="number" id="bulkCount" placeholder="10" value="10">
+                    </div>
+                </div>
+                <div class="btn-group">
+                    <button class="btn btn-success" onclick="generateSingleCode()">Generate Single</button>
+                    <button class="btn btn-primary" onclick="generateBulkCodes()">Generate <span id="bulkCountDisplay">10</span> Codes</button>
+                    <button class="btn btn-secondary" onclick="exportCodes('csv')">Export All as CSV</button>
+                </div>
+                <div id="generatedCode" style="margin-top:16px; padding:12px; background:#27272a; border-radius:8px; display:none;">
+                    <strong>Generated Code:</strong> <code id="codeValue" style="color:#6366f1;"></code>
+                </div>
+                <div id="bulkCodesDisplay" style="margin-top:16px; padding:12px; background:#27272a; border-radius:8px; display:none;"></div>
+            </div>
+
+            <div class="card">
+                <h2>📋 Invite Codes</h2>
+                <div class="search-box">
+                    <input type="text" id="searchBox" placeholder="Search by code, username..." onkeyup="filterTable()">
+                </div>
+                <table id="codesTable">
+                    <thead>
+                        <tr>
+                            <th>Code</th>
+                            <th>Status</th>
+                            <th>Created</th>
+                            <th>Expires</th>
+                            <th>Uses</th>
+                            <th>Claimed By</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="codesBody">
+                    </tbody>
+                </table>
+                <div id="emptyState" class="empty-state">No invite codes found.</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = '';
+        let apiKey = localStorage.getItem('adminApiKey') || '';
+
+        if (apiKey) {
+            document.getElementById('apiKey').value = apiKey;
+            loadDashboard();
+        }
+
+        function saveApiKey() {
+            apiKey = document.getElementById('apiKey').value.trim();
+            if (!apiKey) {
+                showToast('Please enter an API key', 'error');
+                return;
+            }
+            localStorage.setItem('adminApiKey', apiKey);
+            loadDashboard();
+        }
+
+        function showToast(message, type = 'success') {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.className = 'toast show ' + type;
+            setTimeout(() => toast.classList.remove('show'), 3000);
+        }
+
+        async function api(endpoint, method = 'GET', body = null) {
+            const res = await fetch(API_BASE + endpoint, {
+                method,
+                headers: {
+                    'Authorization': `Bearer ${apiKey}`,
+                    'Content-Type': 'application/json'
+                },
+                body: body ? JSON.stringify(body) : null
+            });
+            if (res.status === 403) {
+                showToast('Invalid API key', 'error');
+                throw new Error('Invalid API key');
+            }
+            return res;
+        }
+
+        async function loadDashboard() {
+            const res = await api('/admin/invite-codes');
+            if (!res.ok) {
+                showToast('Failed to load dashboard', 'error');
+                return;
+            }
+            const data = await res.json();
+            displayDashboard(data.invite_codes);
+        }
+
+        function displayDashboard(codes) {
+            document.getElementById('dashboard').style.display = 'block';
+
+            const total = codes.length;
+            const claimed = codes.filter(c => c.is_claimed).length;
+            const pending = total - claimed;
+            const active = codes.filter(c => c.is_active).length;
+
+            document.getElementById('totalCodes').textContent = total;
+            document.getElementById('pendingCodes').textContent = pending;
+            document.getElementById('claimedCodes').textContent = claimed;
+            document.getElementById('activeCodes').textContent = active;
+
+            const tbody = document.getElementById('codesBody');
+            const emptyState = document.getElementById('emptyState');
+            tbody.innerHTML = '';
+
+            if (codes.length === 0) {
+                emptyState.style.display = 'block';
+                return;
+            }
+            emptyState.style.display = 'none';
+
+            codes.forEach(code => {
+                const row = document.createElement('tr');
+                const expiresAt = code.expires_at ? new Date(code.expires_at * 1000).toLocaleString() : 'Never';
+                const createdAt = new Date(code.created_at * 1000).toLocaleString();
+                let statusClass = 'status-pending';
+                let statusText = 'Pending';
+                if (!code.is_active) { statusClass = 'status-inactive'; statusText = 'Inactive'; }
+                else if (code.is_claimed) { statusClass = 'status-claimed'; statusText = 'Claimed'; }
+                else if (code.expires_at && Date.now() > code.expires_at * 1000) { statusClass = 'status-expired'; statusText = 'Expired'; }
+
+                row.innerHTML = `
+                    <td><code>${code.code}</code></td>
+                    <td><span class="status-badge ${statusClass}">${statusText}</span></td>
+                    <td>${createdAt}</td>
+                    <td>${expiresAt}</td>
+                    <td>${code.current_uses}${code.max_uses ? '/' + code.max_uses : ''}</td>
+                    <td>${code.claimed_username || '-'}</td>
+                    <td class="actions">
+                        <button class="btn btn-warning" onclick="deactivateCode('${code.code}')" style="background:#f59e0b;">Deactivate</button>
+                        <button class="btn btn-danger" onclick="deleteCode('${code.code}')">Delete</button>
+                    </td>
+                `;
+                tbody.appendChild(row);
+            });
+        }
+
+        async function generateSingleCode() {
+            const maxUses = document.getElementById('maxUses').value || null;
+            const expiresIn = document.getElementById('expiresIn').value || null;
+            const res = await api('/admin/invite-codes/generate', 'POST', { max_uses: maxUses, expires_in_hours: expiresIn });
+            const data = await res.json();
+            document.getElementById('codeValue').textContent = data.code;
+            document.getElementById('generatedCode').style.display = 'block';
+            showToast('Code generated: ' + data.code);
+            loadDashboard();
+        }
+
+        async function generateBulkCodes() {
+            const count = document.getElementById('bulkCount').value || 10;
+            document.getElementById('bulkCountDisplay').textContent = count;
+            const res = await api('/admin/invite-codes/generate-bulk?count=' + count, 'POST', {});
+            const data = await res.json();
+            const codesDiv = document.getElementById('bulkCodesDisplay');
+            codesDiv.innerHTML = data.codes.map(c => '<code>' + c + '</code><br>').join('');
+            codesDiv.style.display = 'block';
+            showToast(data.count + ' codes generated!');
+            loadDashboard();
+        }
+
+        // Update bulk count display on input change
+        document.addEventListener('DOMContentLoaded', function() {
+            const bulkCountInput = document.getElementById('bulkCount');
+            if (bulkCountInput) {
+                bulkCountInput.addEventListener('input', function() {
+                    document.getElementById('bulkCountDisplay').textContent = this.value || '10';
+                });
+            }
+        });
+
+        async function exportCodes(format) {
+            const res = await api('/admin/invite-codes/export?' + (format === 'excel' ? 'format=xlsx' : 'format=csv'), 'GET');
+            const blob = await res.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'invite_codes_export.' + (format === 'excel' ? 'xlsx' : 'csv');
+            a.click();
+            showToast('Exported!');
+        }
+
+        async function deactivateCode(code) {
+            if (!confirm('Deactivate code ' + code + '?')) return;
+            const res = await api('/admin/invite-codes/' + code + '/deactivate', 'POST');
+            if (res.ok) {
+                showToast('Code deactivated');
+                loadDashboard();
+            }
+        }
+
+        async function deleteCode(code) {
+            if (!confirm('PERMANENTLY DELETE code ' + code + '? This cannot be undone.')) return;
+            const res = await api('/admin/invite-codes/delete/' + code, 'DELETE');
+            if (res.ok) {
+                showToast('Code deleted permanently');
+                loadDashboard();
+            }
+        }
+
+        function filterTable() {
+            const query = document.getElementById('searchBox').value.toLowerCase();
+            const rows = document.querySelectorAll('#codesBody tr');
+            rows.forEach(row => {
+                const text = row.textContent.toLowerCase();
+                row.style.display = text.includes(query) ? '' : 'none';
+            });
+        }
+    </script>
+</body>
+</html>
+"""
+
+
+# ── Pydantic Models ───────────────────────────────────────────────────────
+class GenerateInviteCodeRequest(BaseModel):
+    max_uses: int | None = None
+    expires_in_hours: int | None = None
+
+
+class BulkGenerateInviteCodesRequest(BaseModel):
+    count: int
+    max_uses_per_code: int | None = None
+    expires_in_hours: int | None = None
+
+
+class OnboardRequest(BaseModel):
+    """Request body for claiming an invite code to onboard a user."""
+    invite_code: str
+    """The invite code to claim. Codes are single-use and never expire by default."""
+
+
+class OnboardResponse(BaseModel):
+    """Response when successfully claiming an invite code."""
+    success: bool
+    """Whether the onboard operation was successful."""
+    message: str
+    """Human-readable confirmation message."""
+    invite_code: str
+    """The invite code that was claimed."""
+
+
+class OnboardStatusResponse(BaseModel):
+    """Response indicating whether the current user is onboarded."""
+    onboarded: bool
+    """Whether the user has claimed an invite code."""
+    invite_code: str | None
+    """The invite code used for onboarding, or null if not onboarded."""
+
+
+class InviteCodeStatus(BaseModel):
+    code: str
+    is_valid: bool
+    reason: str | None = None
+
+
+class InviteCodeResponse(BaseModel):
+    code: str
+    created_at: int
+    expires_at: int | None
+    max_uses: int | None
+    current_uses: int
+    is_claimed: bool
+    claimed_by_user_id: int | None
+    claimed_username: str | None
 import wallets
 import bot_tools
 import market_cache
@@ -626,6 +1100,22 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
     )
     bearer_scheme = HTTPBearer(auto_error=False)
 
+    # ── Admin Auth Dependency ──────────────────────────────────────────────
+    async def get_admin_user(
+        credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    ):
+        """
+        Admin-only dependency. Requires the special admin bearer token.
+        """
+        if not credentials:
+            raise HTTPException(status_code=401, detail="Missing authorization header.")
+
+        token = credentials.credentials
+        if token != ADMIN_BEARER_TOKEN:
+            raise HTTPException(status_code=403, detail="Invalid admin credentials.")
+
+        return {"is_admin": True}
+
     # ── Background task: real-time copy trading via WebSocket ──
     async def _execute_copy_trade_callback(
         follower_user_id: int,
@@ -915,6 +1405,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
     ) -> Dict[str, Any]:
         """
         Decode JWT, validate signature and expiry, and ensure the DB session is active.
+        Does NOT check onboarding - use _get_current_session_for_trading for that.
         """
         if credentials is None:
             raise HTTPException(status_code=401, detail="Missing Authorization header.")
@@ -944,6 +1435,22 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
 
         return {"user_id": int(user_id), "session_id": session_id, "payload": payload}
 
+    def _get_current_session_for_trading(
+        current=Depends(_get_current_session),
+    ) -> Dict[str, Any]:
+        """
+        Like _get_current_session but also checks if user is onboarded.
+        Use this for protected endpoints that require onboarding.
+        """
+        user_id = current["user_id"]
+        is_onboarded, _ = db.get_user_onboarding_status(user_id)
+        if not is_onboarded:
+            raise HTTPException(
+                status_code=403,
+                detail="You need to onboard with an invite code first. Use /me/onboard endpoint."
+            )
+        return current
+
     @app.post(
         "/auth/logout",
         tags=["auth"],
@@ -956,12 +1463,411 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         db.revoke_session(current["session_id"])
         return {"success": True}
 
+    # ── Admin Dashboard ───────────────────────────────────────────────────
+
+    @app.get("/admin/dashboard", response_class=HTMLResponse, tags=["admin"])
+    async def admin_dashboard():
+        """
+        Web dashboard for invite code management.
+        Requires admin API key for authentication.
+        """
+        return HTMLResponse(ADMIN_DASHBOARD_HTML)
+
+    # ── Onboarding Endpoints ──────────────────────────────────────────────
+
+    @app.get(
+        "/me/onboarded",
+        tags=["onboarding"],
+        summary="Check if current user is onboarded",
+        response_model=OnboardStatusResponse,
+        responses={
+            200: {"model": OnboardStatusResponse, "description": "Onboarding status"},
+        },
+    )
+    async def check_onboard_status(current=Depends(_get_current_session)):
+        """
+        Check if the current authenticated user has claimed an invite code.
+
+        This endpoint is useful for determining if a user needs to go through
+        the onboarding flow before accessing trading features.
+        """
+        user_id = current["user_id"]
+        is_onboarded, invite_code = db.get_user_onboarding_status(user_id)
+        return {
+            "onboarded": is_onboarded,
+            "invite_code": invite_code,
+        }
+
+    @app.post(
+        "/me/onboard",
+        tags=["onboarding"],
+        summary="Claim an invite code to onboard the current user",
+        response_model=OnboardResponse,
+        responses={
+            200: {"model": OnboardResponse, "description": "Successfully onboarded"},
+            400: {"description": "Invalid code or already onboarded"},
+        },
+    )
+    async def onboard_user(
+        body: OnboardRequest,
+        current=Depends(_get_current_session),
+    ):
+        """
+        Claim an invite code to mark the current authenticated user as "onboarded".
+
+        ## Overview
+        This endpoint allows an authenticated user to redeem a valid invite code.
+        Once claimed, the user is marked as onboarded and gains access to all trading
+        and bot features.
+
+        ## Authentication
+        Requires a valid JWT session token (from `/auth/telegram`). Does NOT generate
+        a new JWT - the existing session is used.
+
+        ## Request Body
+        | Field | Type | Required | Description |
+        |-------|------|----------|-------------|
+        | invite_code | str | Yes | The invite code to claim |
+
+        ## Invite Code Properties
+        - **Single-use**: Each code can only be claimed once
+        - **No expiry**: Codes never expire by default
+        - **Case-insensitive**: Code is normalized to uppercase
+
+        ## Responses
+
+        **200 OK** - Successfully claimed invite code
+        ```json
+        {
+            "success": true,
+            "message": "Successfully onboarded!"
+        }
+        ```
+
+        **400 Bad Request** - Invalid or already used code
+        ```json
+        {
+            "detail": "Invalid invite code or no longer available."
+        }
+        ```
+
+        **400 Bad Request** - User already onboarded
+        ```json
+        {
+            "detail": "You are already onboarded."
+        }
+        ```
+
+        ## Example Usage
+
+        ```bash
+        curl -X POST "http://localhost:7051/me/onboard" \
+            -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"invite_code": "ABC123XYZ"}'
+        ```
+
+        ## Related Endpoints
+        - `GET /me/onboarded` - Check if current user is already onboarded
+        - `POST /admin/invite-codes/generate` - Generate new invite codes (admin only)
+        """
+        invite_code = body.invite_code.strip().upper()
+
+        user_id = current["user_id"]
+
+        # Check if user is already onboarded
+        is_onboarded, _ = db.get_user_onboarding_status(user_id)
+        if is_onboarded:
+            raise HTTPException(
+                status_code=400,
+                detail="You are already onboarded."
+            )
+
+        # Validate and claim invite code
+        success, message = db.claim_invite_code(invite_code, user_id)
+        if not success:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid invite code: {message}"
+            )
+
+        return {
+            "success": True,
+            "message": "Successfully onboarded!",
+            "invite_code": invite_code
+        }
+
+    # ── Admin: Invite Code Generation Endpoints ───────────────────────────
+
+    @app.post(
+        "/admin/invite-codes/generate",
+        tags=["admin"],
+        summary="Generate a single invite code (one-time use, no expiry)",
+    )
+    async def generate_invite_code(
+        request: GenerateInviteCodeRequest,
+        admin=Depends(get_admin_user),
+    ):
+        """
+        Generate a single invite code.
+        Codes are single-use and never expire by default.
+        Requires admin bearer token.
+        """
+        user_id = 0  # Admin mode, no user context needed
+
+        # Codes are single-use and never expire
+        code = db.create_invite_code(
+            created_by=user_id,
+            max_uses=1,
+            expires_at=None,
+        )
+
+        return {
+            "code": code,
+            "max_uses": 1,
+            "expires_at": None,
+            "message": "Code is single-use and never expires."
+        }
+
+    @app.post(
+        "/admin/invite-codes/generate-bulk",
+        tags=["admin"],
+        summary="Generate bulk invite codes (single-use, no expiry)",
+    )
+    async def generate_bulk_invite_codes(
+        count: int = 10,
+        admin=Depends(get_admin_user),
+    ):
+        """
+        Generate bulk invite codes and return them as JSON.
+        Codes are single-use and never expire.
+        Requires admin bearer token.
+        """
+        user_id = 0  # Admin mode, no user context needed
+
+        # Generate codes, single-use, never expire
+        codes = db.bulk_create_invite_codes(
+            created_by=user_id,
+            count=count,
+            max_uses_per_code=1,
+            expires_at=None,
+        )
+
+        return {
+            "count": len(codes),
+            "codes": codes,
+            "message": f"{len(codes)} codes generated. Each code is single-use and never expires."
+        }
+
+    @app.get(
+        "/admin/invite-codes",
+        tags=["admin"],
+        summary="List all invite codes (admin only)",
+    )
+    async def list_invite_codes(admin=Depends(get_admin_user)):
+        """
+        List all invite codes with claim status.
+        Requires admin bearer token.
+        """
+        # Get all invite codes from all users
+        rows = db.execute(
+            """
+            SELECT ic.*, u.username as claimed_username, uc.username as created_by_username
+            FROM invite_codes ic
+            LEFT JOIN users u ON ic.claimed_by = u.user_id
+            LEFT JOIN users uc ON ic.created_by = uc.user_id
+            ORDER BY ic.created_at DESC;
+            """
+        ).fetchall()
+
+        result = []
+        for row in rows:
+            d = dict(row)
+            d["is_claimed"] = d.get("claimed_username") is not None
+            result.append(d)
+        return {"invite_codes": result}
+
+    @app.post(
+        "/admin/invite-codes/{code}/deactivate",
+        tags=["admin"],
+        summary="Deactivate an invite code (admin only)",
+    )
+    async def deactivate_invite_code(
+        code: str,
+        admin=Depends(get_admin_user),
+    ):
+        """
+        Deactivate an invite code so it cannot be used anymore.
+
+        This will also revoke access from any user who claimed this invite code.
+        The user will be marked as not onboarded and will need a new invite code to access the bot.
+
+        Requires admin bearer token.
+        """
+        code_upper = code.upper()
+        code_data = db.get_invite_code(code_upper)
+        if not code_data and not db.execute(
+            "SELECT 1 FROM invite_codes WHERE code = ?;", (code_upper,)
+        ).fetchone():
+            raise HTTPException(status_code=404, detail="Invite code not found.")
+
+        with db.transaction() as conn:
+            # Deactivate the invite code
+            conn.execute(
+                "UPDATE invite_codes SET is_active = 0 WHERE code = ?;",
+                (code_upper,),
+            )
+            # Revoke onboarded status for any user who used this invite code
+            conn.execute(
+                """
+                UPDATE users
+                SET onboarded = 0, invite_code = NULL
+                WHERE invite_code = ?;
+                """,
+                (code_upper,),
+            )
+
+        return {
+            "success": True,
+            "message": f"Invite code {code} deactivated.",
+            "warning": "Users who claimed this code have been deactivated."
+        }
+
+    @app.delete(
+        "/admin/invite-codes/delete/{code}",
+        tags=["admin"],
+        summary="Delete an invite code permanently (admin only)",
+    )
+    async def delete_invite_code(
+        code: str,
+        admin=Depends(get_admin_user),
+    ):
+        """
+        Permanently delete an invite code from the database.
+
+        **WARNING**: This will also revoke access from any user who claimed this invite code.
+        The user will be marked as not onboarded and will need a new invite code to access the bot.
+
+        Requires admin bearer token.
+        """
+        code_upper = code.upper()
+        # Check if code exists (regardless of active status)
+        row = db.execute(
+            "SELECT 1 FROM invite_codes WHERE code = ?;",
+            (code_upper,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Invite code not found.")
+
+        deleted = db.delete_invite_code(code_upper)
+        if not deleted:
+            raise HTTPException(status_code=500, detail="Failed to delete invite code.")
+
+        return {
+            "success": True,
+            "message": f"Invite code {code_upper} deleted permanently.",
+            "warning": "Users who claimed this code have been deactivated."
+        }
+
+    @app.get(
+        "/admin/invite-codes/{code}/stats",
+        tags=["admin"],
+        summary="Get stats for a specific invite code (admin only)",
+    )
+    async def get_invite_code_stats(
+        code: str,
+        admin=Depends(get_admin_user),
+    ):
+        """
+        Get detailed stats for a specific invite code.
+        Requires admin bearer token.
+        """
+        code_data = db.get_invite_code(code.upper())
+        if not code_data:
+            raise HTTPException(status_code=404, detail="Invite code not found.")
+
+        return {
+            "code": code_data["code"],
+            "created_at": code_data["created_at"],
+            "expires_at": code_data.get("expires_at"),
+            "max_uses": code_data.get("max_uses"),
+            "current_uses": code_data["current_uses"],
+            "is_active": bool(code_data["is_active"]),
+            "is_claimed": code_data.get("claimed_by") is not None,
+            "claimed_by_user_id": code_data.get("claimed_by"),
+        }
+
+    @app.get("/admin/invite-codes/export", tags=["admin"], summary="Export all invite codes as CSV")
+    async def export_invite_codes(admin=Depends(get_admin_user)):
+        """
+        Export all invite codes as CSV.
+        Requires admin bearer token.
+        """
+        rows = db.execute(
+            """
+            SELECT ic.*, u.username as claimed_username
+            FROM invite_codes ic
+            LEFT JOIN users u ON ic.claimed_by = u.user_id
+            ORDER BY ic.created_at DESC;
+            """
+        ).fetchall()
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Code", "Status", "Created", "Expires", "Max Uses", "Current Uses", "Claimed By"])
+
+        for row in rows:
+            d = dict(row)
+            status = "inactive" if not d["is_active"] else ("claimed" if d.get("claimed_username") else "pending")
+            expires = d["expires_at"] if d.get("expires_at") else "Never"
+            writer.writerow([d["code"], status, d["created_at"], expires, d.get("max_uses"), d["current_uses"], d.get("claimed_username") or ""])
+
+        output.seek(0)
+        return StreamingResponse(
+            output,
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=invite_codes_export_{int(time.time())}.csv"},
+        )
+
+    @app.post(
+        "/me/onboard",
+        tags=["onboarding"],
+        summary="Onboard existing unonboarded user with invite code (no new JWT)",
+    )
+    async def onboard_existing_user(
+        request: dict,
+        current=Depends(_get_current_session),
+    ):
+        """
+        Onboard an existing user who hasn't completed onboarding yet.
+        Used when user already has a session but wasn't onboarded.
+        """
+        invite_code = request.get("invite_code")
+        if not invite_code:
+            raise HTTPException(status_code=400, detail="Invite code is required.")
+
+        user_id = current["user_id"]
+
+        # Check if user is already onboarded
+        is_onboarded, _ = db.get_user_onboarding_status(user_id)
+        if is_onboarded:
+            raise HTTPException(
+                status_code=400, detail="You are already onboarded."
+            )
+
+        # Validate and claim invite code
+        success, message = db.claim_invite_code(invite_code, user_id)
+        if not success:
+            raise HTTPException(status_code=400, detail=message)
+
+        return {"success": True, "message": "Successfully onboarded!"}
+
     @app.post(
         "/me/copy-trading/enable",
         tags=["copy-trading"],
         summary="Enable copy trading (activates all your hooks as follower)",
     )
-    async def enable_copy_trading(current=Depends(_get_current_session)):
+    async def enable_copy_trading(current=Depends(_get_current_session_for_trading)):
         """
         Enable copy trading for your account.
 
@@ -999,7 +1905,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         tags=["copy-trading"],
         summary="Disable copy trading (deactivates all your hooks)",
     )
-    async def disable_copy_trading(current=Depends(_get_current_session)):
+    async def disable_copy_trading(current=Depends(_get_current_session_for_trading)):
         """
         Disable copy trading for your account.
 
@@ -1037,7 +1943,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         tags=["copy-trading"],
         summary="Get current copy-trading state and followed leaders",
     )
-    async def get_copy_trading_state(current=Depends(_get_current_session)):
+    async def get_copy_trading_state(current=Depends(_get_current_session_for_trading)):
         """
         Get your current copy-trading configuration.
 
@@ -1292,7 +2198,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         summary="Follow a leader by username (creates a hook)",
     )
     async def follow_copy_trading(
-        body: FollowRequest, current=Depends(_get_current_session)
+        body: FollowRequest, current=Depends(_get_current_session_for_trading)
     ):
         """
         Start following a leader for copy trading.
@@ -1467,7 +2373,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         summary="Unfollow a leader by username or wallet (removes hook)",
     )
     async def unfollow_copy_trading(
-        body: FollowRequest, current=Depends(_get_current_session)
+        body: FollowRequest, current=Depends(_get_current_session_for_trading)
     ):
         """
         Stop following a leader for copy trading.
@@ -1564,7 +2470,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         tags=["copy-trading"],
         summary="List leaders the current user is following",
     )
-    async def list_following(current=Depends(_get_current_session)):
+    async def list_following(current=Depends(_get_current_session_for_trading)):
         """
         Get list of all leaders you are currently following.
 
@@ -1638,7 +2544,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         tags=["copy-trading"],
         summary="List copy-trading hooks",
     )
-    async def list_copy_hooks(current=Depends(_get_current_session)):
+    async def list_copy_hooks(current=Depends(_get_current_session_for_trading)):
         """
         Get all your copy-trading hooks (enabled and disabled).
 
@@ -1834,7 +2740,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         tags=["user"],
         summary="Get current user's Polygon wallet token balances and total USD value",
     )
-    async def get_balance(current=Depends(_get_current_session)):
+    async def get_balance(current=Depends(_get_current_session_for_trading)):
         """
         Return a JSON summary of the current user's Polygon wallet balances:
           - list of tokens with symbol, balance, and usd_value
@@ -1860,7 +2766,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         tags=["portfolio"],
         summary="Get full portfolio (positions, PnL, orders) for current user",
     )
-    async def get_portfolio(current=Depends(_get_current_session)):
+    async def get_portfolio(current=Depends(_get_current_session_for_trading)):
         """
         Return a structured JSON summary of the user's Polymarket portfolio:
           - on-chain funds (as text summary)
@@ -2035,7 +2941,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         tags=["portfolio"],
         summary="Claim winnings from resolved Polymarket markets via gasless relayer",
     )
-    async def claim_winnings(current=Depends(_get_current_session)):
+    async def claim_winnings(current=Depends(_get_current_session_for_trading)):
         """
         Trigger a gasless redemption of winnings from resolved Polymarket markets
         for the current user, using the same helper as the Telegram bot.
@@ -2064,7 +2970,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         tags=["portfolio"],
         summary="Run gasless USDC/CTF approvals for Polymarket trading",
     )
-    async def approve_trading(current=Depends(_get_current_session)):
+    async def approve_trading(current=Depends(_get_current_session_for_trading)):
         """
         Manually trigger the full gasless approval flow for the current user.
 
@@ -2105,7 +3011,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         tags=["bridge"],
         summary="Get Polymarket bridge deposit addresses for current user",
     )
-    async def bridge_deposit(current=Depends(_get_current_session)):
+    async def bridge_deposit(current=Depends(_get_current_session_for_trading)):
         """
         Return chain-specific Polymarket bridge deposit addresses for the current
         user. Uses the user's Safe (proxy) address as the Polymarket wallet when
@@ -3700,7 +4606,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         tags=["trading"],
         summary="Swap USDC.e to bridged USDC on Polygon",
     )
-    async def swap(body: SwapRequest, current=Depends(_get_current_session)):
+    async def swap(body: SwapRequest, current=Depends(_get_current_session_for_trading)):
         """
         Swap native USDC.e → bridged USDC on Polygon for the current user.
 
@@ -3779,7 +4685,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         tags=["trading"],
         summary="Execute a Polymarket trade (BUY/SELL) by condition_id",
     )
-    async def trade(body: TradeRequest, current=Depends(_get_current_session)):
+    async def trade(body: TradeRequest, current=Depends(_get_current_session_for_trading)):
         """
         Execute a Polymarket trade. Market is identified by condition_id only.
         """
@@ -3846,7 +4752,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         tags=["trading"],
         summary="Place a LIMIT order (BUY/SELL) by condition_id, price, and size",
     )
-    async def limit_order(body: LimitOrderRequest, current=Depends(_get_current_session)):
+    async def limit_order(body: LimitOrderRequest, current=Depends(_get_current_session_for_trading)):
         """
         Place a LIMIT order in a Polymarket market identified by condition_id.
 
@@ -3987,7 +4893,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         tags=["trading"],
         summary="Open a position (buy) by condition_id and size",
     )
-    async def open_position(body: OpenPositionRequest, current=Depends(_get_current_session)):
+    async def open_position(body: OpenPositionRequest, current=Depends(_get_current_session_for_trading)):
         """
         Open a position: buy shares in a market by condition_id. Size is USD amount to spend.
         """
@@ -4053,7 +4959,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         tags=["trading"],
         summary="Close an existing position (sell) by condition_id",
     )
-    async def close_position(body: ClosePositionRequest, current=Depends(_get_current_session)):
+    async def close_position(body: ClosePositionRequest, current=Depends(_get_current_session_for_trading)):
         """
         Close (sell) an existing position. Fetches your position for the given condition_id,
         then places a SELL order. Use size to partially close, or omit to close full position.

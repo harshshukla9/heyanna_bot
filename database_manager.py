@@ -218,7 +218,9 @@ class DatabaseManager:
                     eth_address     TEXT,
                     eth_private_key TEXT,
                     sol_address     TEXT,
-                    sol_private_key TEXT
+                    sol_private_key TEXT,
+                    invite_code     TEXT,
+                    onboarded       INTEGER DEFAULT 0
                 );
                 """
             )
@@ -235,6 +237,25 @@ class DatabaseManager:
                 """
             )
 
+            # Invite codes table for invite-based authentication
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS invite_codes (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code            TEXT UNIQUE NOT NULL,
+                    created_by      INTEGER,
+                    created_at      INTEGER NOT NULL,
+                    expires_at      INTEGER,
+                    max_uses        INTEGER,
+                    current_uses    INTEGER DEFAULT 0,
+                    claimed_by      INTEGER,
+                    is_active       INTEGER DEFAULT 1,
+                    FOREIGN KEY (created_by) REFERENCES users(user_id),
+                    FOREIGN KEY (claimed_by) REFERENCES users(user_id)
+                );
+                """
+            )
+
             # Optional column to track whether Polymarket approvals have been done.
             # If the column already exists, this will raise an OperationalError we can ignore.
             try:
@@ -243,6 +264,48 @@ class DatabaseManager:
                 )
             except sqlite3.OperationalError:
                 # Column already exists or table is in a state where this is not needed.
+                pass
+
+            # Add invite_code column for invite-based auth
+            try:
+                conn.execute(
+                    "ALTER TABLE users ADD COLUMN invite_code TEXT;"
+                )
+            except sqlite3.OperationalError:
+                pass
+
+            # Add onboarded flag for invite-based auth
+            try:
+                conn.execute(
+                    "ALTER TABLE users ADD COLUMN onboarded INTEGER DEFAULT 0;"
+                )
+            except sqlite3.OperationalError:
+                pass
+
+            # Migrate invite_codes.created_by to allow NULL (for admin-generated codes)
+            # SQLite requires recreating the table to change column constraints
+            try:
+                # Check if invite_codes table exists
+                conn.execute("SELECT 1 FROM invite_codes LIMIT 1;")
+                # Table exists - recreate it with nullable created_by
+                conn.execute("DROP TABLE IF EXISTS invite_codes_new;")
+                conn.execute("""
+                    CREATE TABLE invite_codes_new (
+                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                        code            TEXT UNIQUE NOT NULL,
+                        created_by      INTEGER,
+                        created_at      INTEGER NOT NULL,
+                        expires_at      INTEGER,
+                        max_uses        INTEGER,
+                        current_uses    INTEGER DEFAULT 0,
+                        claimed_by      INTEGER,
+                        is_active       INTEGER DEFAULT 1
+                    );
+                """)
+                conn.execute("INSERT INTO invite_codes_new SELECT * FROM invite_codes;")
+                conn.execute("DROP TABLE invite_codes;")
+                conn.execute("ALTER TABLE invite_codes_new RENAME TO invite_codes;")
+            except sqlite3.OperationalError:
                 pass
 
             # Optional flag indicating whether user has enabled copy trading.
@@ -758,5 +821,221 @@ class DatabaseManager:
                 """
             )
             return cur.rowcount
+
+    # ── Invite Code Methods ──────────────────────────────────────────────
+
+    def create_invite_code(
+        self,
+        created_by: int,
+        max_uses: Optional[int] = None,
+        expires_at: Optional[int] = None,
+    ) -> str:
+        """
+        Create a new invite code and return the code string.
+        """
+        import uuid
+        code = uuid.uuid4().hex[:12].upper()
+        now = int(time.time())
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO invite_codes (code, created_by, created_at, expires_at, max_uses, current_uses, is_active)
+                VALUES (?, ?, ?, ?, ?, 0, 1);
+                """,
+                (code, created_by, now, expires_at, max_uses),
+            )
+        return code
+
+    def bulk_create_invite_codes(
+        self,
+        created_by: int,
+        count: int,
+        max_uses_per_code: Optional[int] = None,
+        expires_at: Optional[int] = None,
+    ) -> list[str]:
+        """
+        Create multiple invite codes and return the list of code strings.
+        """
+        import uuid
+        codes = []
+        now = int(time.time())
+        with self.transaction() as conn:
+            for _ in range(count):
+                code = uuid.uuid4().hex[:12].upper()
+                conn.execute(
+                    """
+                    INSERT INTO invite_codes (code, created_by, created_at, expires_at, max_uses, current_uses, is_active)
+                    VALUES (?, ?, ?, ?, ?, 0, 1);
+                    """,
+                    (code, created_by, now, expires_at, max_uses_per_code),
+                )
+                codes.append(code)
+        return codes
+
+    def get_invite_code(self, code: str) -> Optional[dict]:
+        """
+        Get invite code by code string. Returns None if not found or inactive.
+        """
+        row = self.execute(
+            """
+            SELECT * FROM invite_codes
+            WHERE code = ? AND is_active = 1;
+            """,
+            (code.upper(),),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def validate_invite_code(self, code: str) -> tuple[bool, str]:
+        """
+        Validate an invite code. Returns (is_valid, message).
+        """
+        code = code.upper().strip()
+        code_data = self.get_invite_code(code)
+        if not code_data:
+            return False, "Invalid invite code."
+
+        import time
+        now = int(time.time())
+
+        # Check expiry
+        if code_data.get("expires_at") and code_data["expires_at"] < now:
+            return False, "Invite code has expired."
+
+        # Check max uses
+        max_uses = code_data.get("max_uses")
+        if max_uses and code_data["current_uses"] >= max_uses:
+            return False, "Invite code has been used the maximum number of times."
+
+        return True, "Valid invite code."
+
+    def claim_invite_code(self, code: str, user_id: int) -> tuple[bool, str]:
+        """
+        Claim an invite code for a user. Returns (success, message).
+        """
+        code = code.upper().strip()
+        code_data = self.get_invite_code(code)
+
+        if not code_data:
+            return False, "Invalid invite code."
+
+        import time
+        now = int(time.time())
+
+        # Check expiry
+        if code_data.get("expires_at") and code_data["expires_at"] < now:
+            return False, "Invite code has expired."
+
+        # Check max uses
+        max_uses = code_data.get("max_uses")
+        if max_uses and code_data["current_uses"] >= max_uses:
+            return False, "Invite code has been used the maximum number of times."
+
+        with self.transaction() as conn:
+            # Mark code as claimed
+            conn.execute(
+                """
+                UPDATE invite_codes
+                SET current_uses = current_uses + 1, claimed_by = ?
+                WHERE code = ?;
+                """,
+                (user_id, code),
+            )
+
+            # Mark user as onboarded with their invite code
+            conn.execute(
+                """
+                UPDATE users
+                SET onboarded = 1, invite_code = ?
+                WHERE user_id = ?;
+                """,
+                (code, user_id),
+            )
+
+        return True, "Successfully claimed invite code."
+
+    def get_invite_codes_for_user(self, created_by: int) -> list[dict]:
+        """
+        Get all invite codes created by a user, with claim status.
+        """
+        rows = self.execute(
+            """
+            SELECT ic.*, u.username as claimed_username
+            FROM invite_codes ic
+            LEFT JOIN users u ON ic.claimed_by = u.user_id
+            WHERE ic.created_by = ?
+            ORDER BY ic.created_at DESC;
+            """,
+            (created_by,),
+        ).fetchall()
+
+        result = []
+        for row in rows:
+            d = dict(row)
+            d["is_claimed"] = d["claimed_username"] is not None
+            result.append(d)
+        return result
+
+    def update_user_onboarded(self, user_id: int, invite_code: Optional[str] = None) -> None:
+        """
+        Mark a user as onboarded, optionally with an invite code.
+        """
+        with self.transaction() as conn:
+            if invite_code:
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET onboarded = 1, invite_code = ?
+                    WHERE user_id = ?;
+                    """,
+                    (invite_code.upper(), user_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE users SET onboarded = 1 WHERE user_id = ?;",
+                    (user_id,),
+                )
+
+    def get_user_onboarding_status(self, user_id: int) -> tuple[bool, Optional[str]]:
+        """
+        Check if a user is onboarded. Returns (is_onboarded, invite_code).
+        """
+        row = self.execute(
+            "SELECT onboarded, invite_code FROM users WHERE user_id = ?;",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            return False, None
+        return bool(row["onboarded"]), row["invite_code"]
+
+    def delete_invite_code(self, code: str) -> bool:
+        """
+        Permanently delete an invite code and revoke access for users who used it.
+        Returns True if deleted.
+        """
+        code = code.upper()
+        with self.transaction() as conn:
+            # First, get the claimed_by user_id if any
+            cur = conn.execute(
+                "SELECT claimed_by FROM invite_codes WHERE code = ?;",
+                (code,),
+            )
+            row = cur.fetchone()
+
+            # Revoke onboarded status for any user who used this invite code
+            conn.execute(
+                """
+                UPDATE users
+                SET onboarded = 0, invite_code = NULL
+                WHERE invite_code = ?;
+                """,
+                (code,),
+            )
+
+            # Delete the invite code
+            cur = conn.execute(
+                "DELETE FROM invite_codes WHERE code = ?;",
+                (code,),
+            )
+            return cur.rowcount > 0
 
 
