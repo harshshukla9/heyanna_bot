@@ -4,8 +4,9 @@ import time
 from typing import Union
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import MarketOrderArgs, OrderArgs, OrderType
+from py_clob_client.clob_types import MarketOrderArgs, OrderArgs, OrderType, PartialCreateOrderOptions
 from py_clob_client.exceptions import PolyApiException
+from py_clob_client.order_builder.constants import BUY, SELL
 
 from database_manager import DatabaseManager
 import market_cache
@@ -108,18 +109,38 @@ def _force_reapprove(db: DatabaseManager, user_id: int, owner_addr: str) -> bool
 def _parse_order_response(resp) -> tuple[str, str, str]:
     """Extract (order_id, status, tx_hash) from a CLOB post_order response."""
     if isinstance(resp, dict):
-        order_id = resp.get("orderID", resp.get("id", "N/A"))
-        status = resp.get("status", "submitted")
-        tx_hashes = resp.get("transactionsHashes") or resp.get("transactionHashes") or []
-        tx_hash = (
-            tx_hashes[0] if tx_hashes else
-            resp.get("transactHash") or resp.get("txHash") or resp.get("transactionHash") or "pending"
+        order_id = (
+            resp.get("orderID")
+            or resp.get("orderId")
+            or resp.get("order_id")
+            or resp.get("id")
+            or resp.get("hash")
+            or "N/A"
         )
+        if order_id and order_id != "N/A" and not isinstance(order_id, str):
+            order_id = str(order_id)
+        status = (
+            resp.get("status")
+            or resp.get("orderStatus")
+            or resp.get("order_status")
+            or "submitted"
+        )
+        tx_hashes = resp.get("transactionsHashes") or resp.get("transactionHashes") or resp.get("transaction_hashes") or []
+        tx_hash = (
+            (tx_hashes[0] if tx_hashes else None)
+            or resp.get("transactHash")
+            or resp.get("txHash")
+            or resp.get("transactionHash")
+            or resp.get("transaction_hash")
+            or "pending"
+        )
+        if tx_hash and not isinstance(tx_hash, str):
+            tx_hash = str(tx_hash)
     else:
         order_id = str(resp)
         status = "submitted"
         tx_hash = "pending"
-    return order_id, status, tx_hash
+    return (order_id or "N/A"), (status or "submitted"), (tx_hash or "pending")
 
 
 def execute_trade_for_user(
@@ -431,14 +452,27 @@ def execute_limit_order_for_user(
         try:
             trade_client = _create_clob_client(private_key, use_safe, trading_addr)
 
+            # Step 1: Create and sign locally with options (tick_size, neg_risk)
+            try:
+                tick_size = trade_client.get_tick_size(token_id)
+            except Exception:
+                tick_size = "0.01"
+            try:
+                neg_risk = trade_client.get_neg_risk(token_id)
+            except Exception:
+                neg_risk = False
+            options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
+            side_const = BUY if order_side_clean == "BUY" else SELL
             order_args = OrderArgs(
                 token_id=token_id,
                 price=price_val,
                 size=size_val,
-                side=order_side_clean,
+                side=side_const,
             )
-            signed = trade_client.create_order(order_args)
-            resp = trade_client.post_order(signed, orderType=OrderType.GTC)
+            signed_order = trade_client.create_order(order_args, options=options)
+
+            # Step 2: Submit to the CLOB
+            resp = trade_client.post_order(signed_order, orderType=OrderType.GTC)
             order_id, status, tx_hash = _parse_order_response(resp)
             break
 
@@ -538,7 +572,7 @@ def cancel_order_for_user(
 
 def get_open_orders_for_user(db: DatabaseManager, user_id: int):
     """
-    Fetch open (resting) orders for the user from Polymarket CLOB.
+    Fetch all open (resting) orders for the user from Polymarket CLOB.
     Returns list of orders; each has 'id' which is the order_id to use for cancel.
     """
     db_user = db.get_user(user_id)
@@ -558,5 +592,57 @@ def get_open_orders_for_user(db: DatabaseManager, user_id: int):
         return client.get_orders()
     except Exception as e:
         logger.error("Get open orders failed: %s", e)
+        return None
+
+
+def get_open_orders_page_for_user(
+    db: DatabaseManager,
+    user_id: int,
+    market: str | None = None,
+    order_id: str | None = None,
+    asset_id: str | None = None,
+    next_cursor: str | None = None,
+):
+    """
+    Fetch one page of open orders from Polymarket CLOB (GET /data/orders).
+    Returns {"data": list, "next_cursor": str} for pagination.
+    """
+    from py_clob_client.clob_types import OpenOrderParams, RequestArgs
+    from py_clob_client.endpoints import ORDERS
+    from py_clob_client.http_helpers.helpers import add_query_open_orders_params, get
+
+    from py_clob_client.headers.headers import create_level_2_headers
+
+    db_user = db.get_user(user_id)
+    if not db_user:
+        return None
+
+    private_key = db_user["eth_private_key"]
+    if not private_key:
+        return None
+
+    owner_addr = db_user.get("eth_address") or ""
+    trading_addr = get_trading_wallet_address(owner_addr)
+    use_safe = trading_addr and trading_addr.lower() != owner_addr.lower()
+
+    try:
+        client = _create_clob_client(private_key, use_safe, trading_addr)
+        client.assert_level_2_auth()
+        params = OpenOrderParams(
+            id=order_id or "",
+            market=market or "",
+            asset_id=asset_id or "",
+        )
+        request_args = RequestArgs(method="GET", request_path=ORDERS)
+        headers = create_level_2_headers(client.signer, client.creds, request_args)
+        cursor = next_cursor if next_cursor else "MA=="
+        url = add_query_open_orders_params(f"{client.host}{ORDERS}", params, cursor)
+        response = get(url, headers=headers)
+        return {
+            "data": response.get("data") or [],
+            "next_cursor": response.get("next_cursor") or "",
+        }
+    except Exception as e:
+        logger.error("Get open orders page failed: %s", e)
         return None
 

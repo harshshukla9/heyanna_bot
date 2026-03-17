@@ -86,6 +86,9 @@ chat_sessions: Dict[int, List[dict]] = {}
 # the last market / side selected via buttons or commands.
 active_market_context: Dict[int, dict] = {}
 
+# In-memory state for one-off typed inputs (e.g., setting custom signal trade amount).
+_pending_signal_amount_input: Dict[int, bool] = {}
+
 # Telegram callback_data has a strict 64-byte limit. Use short aliases for
 # markets and resolve back to condition IDs server-side.
 _alias_to_condition: Dict[int, str] = {}
@@ -1008,6 +1011,7 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                     InlineKeyboardButton("🔄 Refresh", callback_data="home:refresh"),
                 ],
                 [
+                    InlineKeyboardButton("📡 Signal trading", callback_data="home:signals"),
                     InlineKeyboardButton("👥 Referrals", callback_data="home:referrals"),
                     InlineKeyboardButton("⚙️ Settings", callback_data="home:settings"),
                 ],
@@ -1946,6 +1950,60 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 await _send_copy_trading_state(query.message.chat_id, context.bot, db_user)
             return
 
+    async def handle_signals_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        try:
+            await query.answer()
+        except BadRequest:
+            return
+        data = query.data or ""
+        if not data.startswith("signals:"):
+            return
+
+        db_user = db.get_user(query.from_user.id) if query.from_user else None
+        if not db_user:
+            await _safe_edit_message(query, "Please run /start first.")
+            return
+
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        if action in ("enable", "disable"):
+            flag = 1 if action == "enable" else 0
+            with db.transaction() as conn:
+                conn.execute(
+                    "UPDATE users SET signal_trading_enabled = ? WHERE user_id = ?;",
+                    (flag, db_user["user_id"]),
+                )
+            db_user = db.get_user(db_user["user_id"]) or db_user
+            await _render_signal_trading_menu(query.message.chat_id, context.bot, db_user, query=query)
+            return
+
+        if action == "amt" and len(parts) >= 3:
+            choice = parts[2].strip()
+            if choice == "custom":
+                _pending_signal_amount_input[int(db_user["user_id"])] = True
+                await _safe_edit_message(
+                    query,
+                    "Send the amount in USD you want to use per 5m signal (example: `10`).",
+                    parse_mode="Markdown",
+                )
+                return
+            try:
+                amt = float(choice)
+            except Exception:
+                amt = 0.0
+            if amt <= 0:
+                await _safe_edit_message(query, "Invalid amount.")
+                return
+            with db.transaction() as conn:
+                conn.execute(
+                    "UPDATE users SET signal_trade_amount_usd = ? WHERE user_id = ?;",
+                    (amt, db_user["user_id"]),
+                )
+            db_user = db.get_user(db_user["user_id"]) or db_user
+            await _render_signal_trading_menu(query.message.chat_id, context.bot, db_user, query=query)
+            return
+
         if action == "all_leaders":
             # Show all followed leaders with unfollow buttons
             db_user = db.get_user(query.from_user.id)
@@ -2111,6 +2169,8 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
     # ── Copy-trading notification loop (push messages for copied trades) ──
 
     _last_notified_copy_trade_id: int = 0
+    _signal_log_pos: int = 0
+    _signal_last_sent_ts: dict[str, int] = {}
 
     async def _copy_trading_notification_loop(app: Application) -> None:
         """
@@ -2214,6 +2274,258 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 logger.warning(f"Error in copy-trading notification loop: {e}")
                 await asyncio.sleep(10)
 
+    async def _signal_outbox_delivery_loop(app: Application) -> None:
+        """
+        Background task that delivers queued signal-trading notifications from
+        signal_notifications_outbox and marks them as sent.
+        """
+        while True:
+            try:
+                rows = db.execute(
+                    """
+                    SELECT id, user_id, kind, text, created_at
+                    FROM signal_notifications_outbox
+                    WHERE sent_at IS NULL
+                    ORDER BY created_at ASC
+                    LIMIT 50;
+                    """
+                ).fetchall()
+                if not rows:
+                    await asyncio.sleep(3)
+                    continue
+
+                now_ts = int(time.time())
+                for r in rows:
+                    d = dict(r)
+                    oid = int(d.get("id") or 0)
+                    uid = int(d.get("user_id") or 0)
+                    text = str(d.get("text") or "").strip()
+                    if oid <= 0 or uid <= 0 or not text:
+                        try:
+                            db.execute(
+                                "UPDATE signal_notifications_outbox SET sent_at = ? WHERE id = ?;",
+                                (now_ts, oid),
+                            )
+                        except Exception:
+                            pass
+                        continue
+
+                    try:
+                        await app.bot.send_message(chat_id=uid, text=text)
+                        db.execute(
+                            "UPDATE signal_notifications_outbox SET sent_at = ? WHERE id = ?;",
+                            (int(time.time()), oid),
+                        )
+                    except Forbidden:
+                        # User blocked the bot; mark as sent to avoid retry loops.
+                        try:
+                            db.execute(
+                                "UPDATE signal_notifications_outbox SET sent_at = ? WHERE id = ?;",
+                                (int(time.time()), oid),
+                            )
+                        except Exception:
+                            pass
+                    except RetryAfter as e:
+                        await asyncio.sleep(float(getattr(e, "retry_after", 1) or 1))
+                    except Exception as e:
+                        logger.warning("Failed to deliver outbox notification %s to %s: %s", oid, uid, e)
+
+            except Exception as e:
+                logger.warning("Error in outbox delivery loop: %s", e)
+            await asyncio.sleep(2)
+
+    def _build_signal_broadcast_text(payload: dict) -> str:
+        """
+        Create a neutral signal notification message for Telegram users.
+        Intentionally avoids channel branding terms in the text.
+        """
+        side = str(payload.get("signal") or "").upper().strip() or "UNKNOWN"
+        series = str(payload.get("series") or "").strip()
+        asset = str(payload.get("asset") or "").strip()
+        timeframe = str(payload.get("timeframe") or "").strip()
+        signal_time = (
+            str(payload.get("time_utc_display") or "").strip()
+            or str(payload.get("signal_at") or "").strip()
+        )
+        lines = [
+            "🔔 New trading signal generated",
+            f"Direction: {side}",
+        ]
+        if series:
+            lines.append(f"Series: {series}")
+        if asset and not series:
+            lines.append(f"Asset: {asset}")
+        if timeframe:
+            lines.append(f"Timeframe: {timeframe}")
+        if signal_time:
+            lines.append(f"Signal time: {signal_time}")
+        lines.append("Use /markets to review opportunities.")
+        return "\n".join(lines)
+
+    def _signal_window_seconds(timeframe: str) -> int:
+        """
+        Dedup/throttle window for signals to avoid concurrent strategies spamming.
+        - 5M -> 300 seconds
+        - 15M -> 900 seconds
+        Falls back to parsing '<N>M' to N*60; returns 0 if unknown.
+        """
+        tf = (timeframe or "").strip().upper()
+        if not tf:
+            return 0
+        if tf.endswith("M"):
+            try:
+                mins = int(tf[:-1])
+                return max(0, mins) * 60
+            except Exception:
+                return 0
+        return 0
+
+    def _signal_dedup_key(payload: dict) -> str:
+        # Prefer Polymarket "series" for concurrency filtering (signals are series-level).
+        series = str(payload.get("series_slug") or payload.get("series") or "").strip().upper()
+        asset = str(payload.get("asset") or "").strip().upper()
+        scope = series or asset or "MARKET"
+        tf = str(payload.get("timeframe") or "").strip().upper()
+        return f"{scope}:{tf}"
+
+    async def _announcement_signal_broadcast_loop(app: Application) -> None:
+        """
+        Broadcast newly generated live signal events to all known bot users.
+        Reads incremental JSONL updates from TELEGRAM_SIGNAL_OUTPUT.
+        """
+        nonlocal _signal_log_pos
+        signal_path = (os.getenv("TELEGRAM_SIGNAL_OUTPUT") or "logs/announcement_signals.jsonl").strip()
+        if not signal_path:
+            signal_path = "logs/announcement_signals.jsonl"
+
+        # Fast-forward on startup so we only broadcast signals generated after bot start.
+        try:
+            with open(signal_path, "r", encoding="utf-8") as f:
+                f.seek(0, os.SEEK_END)
+                _signal_log_pos = f.tell()
+        except FileNotFoundError:
+            _signal_log_pos = 0
+        except Exception as e:
+            logger.warning("Signal broadcaster init failed for %s: %s", signal_path, e)
+            _signal_log_pos = 0
+
+        while True:
+            try:
+                if not os.path.exists(signal_path):
+                    await asyncio.sleep(3)
+                    continue
+
+                with open(signal_path, "r", encoding="utf-8") as f:
+                    # Handle log rotation/truncation.
+                    try:
+                        file_size = os.path.getsize(signal_path)
+                    except Exception:
+                        file_size = None
+                    if file_size is not None and _signal_log_pos > file_size:
+                        _signal_log_pos = 0
+                    f.seek(_signal_log_pos)
+                    new_lines = f.readlines()
+                    _signal_log_pos = f.tell()
+
+                if not new_lines:
+                    await asyncio.sleep(3)
+                    continue
+
+                live_payloads: list[dict] = []
+                for line in new_lines:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        obj = json.loads(s)
+                    except Exception:
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    if not obj.get("parsed"):
+                        continue
+                    # Only broadcast newly observed live signals.
+                    source = str(obj.get("source") or "")
+                    if source != "live:new":
+                        continue
+                    live_payloads.append(obj)
+
+                if not live_payloads:
+                    await asyncio.sleep(1)
+                    continue
+
+                user_rows = db.execute(
+                    "SELECT user_id FROM users WHERE user_id IS NOT NULL;"
+                ).fetchall()
+                user_ids = [int(r["user_id"]) for r in user_rows if r and r["user_id"] is not None]
+                if not user_ids:
+                    await asyncio.sleep(1)
+                    continue
+
+                for payload in live_payloads:
+                    # Concurrency guard: if multiple strategies emit around the same time,
+                    # only broadcast the first signal within its market window.
+                    tf = str(payload.get("timeframe") or "").strip()
+                    window = _signal_window_seconds(tf)
+                    if window > 0:
+                        try:
+                            ts = int(payload.get("signal_ts") or 0) or int(time.time())
+                        except Exception:
+                            ts = int(time.time())
+                        key = _signal_dedup_key(payload)
+                        last_ts = int(_signal_last_sent_ts.get(key) or 0)
+                        if last_ts and ts < (last_ts + window):
+                            continue
+                        _signal_last_sent_ts[key] = ts
+
+                    text = _build_signal_broadcast_text(payload)
+                    for uid in user_ids:
+                        try:
+                            await app.bot.send_message(chat_id=uid, text=text)
+                        except Exception as e:
+                            logger.warning("Failed signal broadcast to %s: %s", uid, e)
+
+            except Exception as e:
+                logger.warning("Error in signal broadcast loop: %s", e)
+                await asyncio.sleep(3)
+
+    async def _render_signal_trading_menu(chat_id: int, bot: Bot, db_user: dict, query=None) -> None:
+        enabled = bool(db_user.get("signal_trading_enabled") or 0)
+        amt = float(db_user.get("signal_trade_amount_usd") or 0.0)
+        status = "ON" if enabled else "OFF"
+        text = (
+            "📡 *Signal trading*\n\n"
+            "Auto-trade *5 minute* series signals using your smart wallet.\n\n"
+            f"Status: *{status}*\n"
+            f"Amount per signal: *${amt:.2f}*\n\n"
+            "Choose an action below."
+        )
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ Enable" if not enabled else "⏸ Disable",
+                        callback_data=f"signals:{'enable' if not enabled else 'disable'}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton("$5", callback_data="signals:amt:5"),
+                    InlineKeyboardButton("$10", callback_data="signals:amt:10"),
+                    InlineKeyboardButton("$20", callback_data="signals:amt:20"),
+                ],
+                [
+                    InlineKeyboardButton("✍️ Custom amount", callback_data="signals:amt:custom"),
+                ],
+                [
+                    InlineKeyboardButton("🏠 Main Menu", callback_data="home:main"),
+                ],
+            ]
+        )
+        if query is not None:
+            await _safe_edit_message(query, text, parse_mode="Markdown", reply_markup=kb)
+        else:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", reply_markup=kb)
+
     async def handle_home_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         try:
@@ -2246,6 +2558,10 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             return
         if choice == "help":
             await help_cmd(update, context)
+            return
+
+        if choice == "signals":
+            await _render_signal_trading_menu(query.message.chat_id, context.bot, db_user, query=query)
             return
 
         if choice in ("referrals", "settings"):
@@ -3229,6 +3545,25 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             )
             return
 
+        # Custom amount input for signal trading.
+        if _pending_signal_amount_input.get(int(user.id)):
+            try:
+                amt = float(user_text.strip())
+                if amt <= 0:
+                    raise ValueError
+            except Exception:
+                await update.message.reply_text("Please send a positive number (example: 10).")
+                return
+            with db.transaction() as conn:
+                conn.execute(
+                    "UPDATE users SET signal_trade_amount_usd = ? WHERE user_id = ?;",
+                    (amt, int(user.id)),
+                )
+            _pending_signal_amount_input.pop(int(user.id), None)
+            db_user = db.get_user(int(user.id)) or db_user
+            await _render_signal_trading_menu(update.effective_chat.id, context.bot, db_user)
+            return
+
         # Manual follow flow: first capture wallet, then ask for risk settings.
         if context.user_data.get("awaiting_follow_wallet"):
             import re as _re
@@ -3750,10 +4085,13 @@ _Tap buttons below to trade or analyze._"""
             ],
         ]
         display_id = market_id if market_id is not None else (condition_id or identifier)[:10]
+        question = _mget(m, "question", "") or "this market"
+        odds_map = _mget(m, "odds", {}) or {}
+        odds_val = odds_map.get(side, "?")
         msg = (
             f"**Trade {display_id}** — {side}\n\n"
-            f"Question: {m.question}\n"
-            f"Odds: {m.odds.get(side, '?')}¢\n\n"
+            f"Question: {question}\n"
+            f"Odds: {odds_val}¢\n\n"
             f"Choose amount or type: `trade {display_id} {side} 10`"
         )
         await _safe_edit_message(
@@ -3822,6 +4160,18 @@ _Tap buttons below to trade or analyze._"""
         except Exception as e:
             logger.warning(f"Failed to start copy-trading notification loop: {e}")
 
+        # Start background signal broadcast loop (fire-and-forget).
+        try:
+            asyncio.create_task(_announcement_signal_broadcast_loop(app))
+        except Exception as e:
+            logger.warning(f"Failed to start signal broadcast loop: {e}")
+
+        # Start background outbox delivery loop (signal-trading notifications).
+        try:
+            asyncio.create_task(_signal_outbox_delivery_loop(app))
+        except Exception as e:
+            logger.warning(f"Failed to start signal outbox delivery loop: {e}")
+
     async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Global error handler so Telegram exceptions are handled gracefully."""
         err = context.error
@@ -3886,7 +4236,8 @@ _Tap buttons below to trade or analyze._"""
     app.add_handler(CallbackQueryHandler(handle_help_menu_callback, pattern=r"^help:(first_trade|account|funds|copy)$"))
     app.add_handler(CallbackQueryHandler(handle_copycfg_callback, pattern=r"^copycfg:(enable|disable|refresh|leaders|follow_manual|unfollow_all|all_leaders)$"))
     app.add_handler(CallbackQueryHandler(handle_unfollow_callback, pattern=r"^copyunfollow:\d+$"))
-    app.add_handler(CallbackQueryHandler(handle_home_callback, pattern=r"^home:(markets|copy|portfolio|wallet|smart_wallets|refresh|limit_orders|referrals|settings|help|main)$"))
+    app.add_handler(CallbackQueryHandler(handle_home_callback, pattern=r"^home:(markets|copy|portfolio|wallet|smart_wallets|signals|refresh|limit_orders|referrals|settings|help|main)$"))
+    app.add_handler(CallbackQueryHandler(handle_signals_callback, pattern=r"^signals:(enable|disable|amt:.+)$"))
     app.add_handler(CallbackQueryHandler(handle_copy_callback, pattern=r"^copy:(view_more|.+)$"))
     app.add_handler(CallbackQueryHandler(handle_copyfollow_callback, pattern=r"^copyfollow:0x[a-fA-F0-9]{40}$"))
     app.add_handler(CallbackQueryHandler(handle_copyrisk_callback, pattern=r"^copyrisk:(none|cancel|[\d.]+)$"))

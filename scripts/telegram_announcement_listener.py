@@ -49,6 +49,62 @@ TIMEFRAME_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600}
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
+import requests
+
+
+def _extract_gamma_event_slug(text: str) -> str | None:
+    """
+    Extract Polymarket Gamma event slug from a URL in the message.
+    Supports URLs like:
+      https://gamma-api.polymarket.com/events/slug/<slug>?
+    """
+    src = (text or "").strip()
+    if not src:
+        return None
+    m = re.search(r"gamma-api\.polymarket\.com/events/slug/([^?\s/]+)", src, re.IGNORECASE)
+    if not m:
+        return None
+    return (m.group(1) or "").strip() or None
+
+
+def _fetch_gamma_event_by_slug(slug: str) -> dict[str, Any] | None:
+    """
+    Best-effort fetch of a Gamma event object by slug.
+    """
+    if not slug:
+        return None
+    url = f"https://gamma-api.polymarket.com/events/slug/{slug}"
+    try:
+        r = requests.get(url, timeout=8)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _iso_to_ts(iso: str | None) -> int | None:
+    """
+    Parse an ISO-8601 datetime string to epoch seconds (UTC).
+    Gamma typically returns strings like '2026-03-17T11:35:00Z'.
+    """
+    if not iso:
+        return None
+    s = str(iso).strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return None
 
 
 @dataclass
@@ -214,6 +270,20 @@ def parse_signal_from_text(text: str) -> dict[str, Any] | None:
         tf_label = {"1m": "1 min", "5m": "5 min", "15m": "15 min", "30m": "30 min", "1h": "1 hour"}.get(timeframe, timeframe)
         market = f"Will Bitcoin go up in next {tf_label}?"
 
+    # Polymarket "series" concept: signals may apply to a broader series/collection.
+    # Try to extract a human-readable series name from the message; fall back to market.
+    series: str | None = None
+    m_series = re.search(r"(?im)^\s*Series:\s*(.+?)\s*$", src)
+    if m_series:
+        series = (m_series.group(1) or "").strip() or None
+    if series is None:
+        # Some formats may use "Market:" to denote the series label.
+        m_series2 = re.search(r"(?im)^\s*Market:\s*(.+?)\s*$", src)
+        if m_series2:
+            series = (m_series2.group(1) or "").strip() or None
+    if series is None:
+        series = market
+
     confidence_pct = None
     m_conf = re.search(r"\b(\d{1,3})\s*%", src)
     if m_conf:
@@ -225,6 +295,8 @@ def parse_signal_from_text(text: str) -> dict[str, Any] | None:
     out: dict[str, Any] = {
         "asset": asset,
         "timeframe": timeframe,
+        "series": series,
+        "series_slug": None,
         "market": market,
         "signal": side,
         "direction": direction,
@@ -286,6 +358,47 @@ async def run_listener(
                 _append_jsonl(cfg.output_path, payload)
                 seen_keys.add(key)
             return
+
+        # If the message contains a Gamma event URL, enrich "series" from Polymarket's canonical series.
+        try:
+            slug = _extract_gamma_event_slug(text)
+            if slug:
+                event_obj = await asyncio.to_thread(_fetch_gamma_event_by_slug, slug)
+                if isinstance(event_obj, dict):
+                    parsed["event_slug"] = slug
+                    series_slug = (event_obj.get("seriesSlug") or "").strip() or None
+                    series_title = None
+                    try:
+                        series_arr = event_obj.get("series") or []
+                        if isinstance(series_arr, list) and series_arr:
+                            s0 = series_arr[0]
+                            if isinstance(s0, dict):
+                                series_title = (s0.get("title") or "").strip() or None
+                    except Exception:
+                        series_title = None
+                    parsed["series_slug"] = series_slug
+                    # Prefer human title if present, else slug.
+                    parsed["series"] = series_title or series_slug or parsed.get("series")
+
+                    # Market targeting for time-critical series signals (use first market in event).
+                    try:
+                        markets = event_obj.get("markets") or []
+                        if isinstance(markets, list) and markets:
+                            m0 = markets[0] if isinstance(markets[0], dict) else None
+                        else:
+                            m0 = None
+                        if m0:
+                            cid = (m0.get("conditionId") or m0.get("conditionID") or m0.get("condition_id") or "").strip()
+                            if cid:
+                                parsed["condition_id"] = cid
+                            end_ts = _iso_to_ts(m0.get("endDate") or m0.get("end_date"))
+                            if end_ts:
+                                parsed["end_ts"] = int(end_ts)
+                                parsed["end_at"] = (m0.get("endDate") or m0.get("end_date"))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
         msg_date = getattr(msg, "date", None)
         # Prefer "Time: 21:40 UTC" from message for signal_ts when present.

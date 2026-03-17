@@ -1706,13 +1706,18 @@ def execute_trade(market_id: int, side: str, amount: str, address: str) -> str:
             resp = client.post_order(signed_order, orderType=OrderType.FOK)
 
             if isinstance(resp, dict):
-                order_id = resp.get("orderID", resp.get("id", "N/A"))
-                status = resp.get("status", "submitted")
+                order_id = (
+                    resp.get("orderID") or resp.get("orderId") or resp.get("order_id")
+                    or resp.get("id") or resp.get("hash") or "N/A"
+                )
+                order_id = str(order_id).strip() if order_id else "N/A"
+                status = resp.get("status") or resp.get("orderStatus") or "submitted"
                 tx_hashes = resp.get("transactionsHashes") or resp.get("transactionHashes") or []
                 tx_hash = (
-                    tx_hashes[0] if tx_hashes else
-                    resp.get("transactHash") or resp.get("txHash") or resp.get("transactionHash") or "pending"
+                    (tx_hashes[0] if tx_hashes else None)
+                    or resp.get("transactHash") or resp.get("txHash") or resp.get("transactionHash") or "pending"
                 )
+                tx_hash = str(tx_hash) if tx_hash else "pending"
             else:
                 order_id = str(resp)
                 status = "submitted"
@@ -1828,10 +1833,15 @@ def execute_sell_position(market_id: int, outcome: str, shares: float, address: 
             resp = client.post_order(signed_order, orderType=OrderType.FOK)
 
             if isinstance(resp, dict):
-                order_id = resp.get("orderID", resp.get("id", "N/A"))
-                status = resp.get("status", "submitted")
+                order_id = (
+                    resp.get("orderID") or resp.get("orderId") or resp.get("order_id")
+                    or resp.get("id") or resp.get("hash") or "N/A"
+                )
+                order_id = str(order_id).strip() if order_id else "N/A"
+                status = resp.get("status") or resp.get("orderStatus") or "submitted"
                 tx_hashes = resp.get("transactionsHashes") or resp.get("transactionHashes") or []
-                tx_hash = tx_hashes[0] if tx_hashes else resp.get("transactHash") or resp.get("txHash") or "pending"
+                tx_hash = (tx_hashes[0] if tx_hashes else None) or resp.get("transactHash") or resp.get("txHash") or "pending"
+                tx_hash = str(tx_hash) if tx_hash else "pending"
             else:
                 order_id = str(resp)
                 status = "submitted"

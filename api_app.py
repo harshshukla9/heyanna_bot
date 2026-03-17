@@ -499,7 +499,12 @@ import wallets
 import bot_tools
 import market_cache
 import llm
-from trading import execute_trade_for_user, cancel_order_for_user, get_open_orders_for_user
+from trading import (
+    execute_trade_for_user,
+    cancel_order_for_user,
+    get_open_orders_for_user,
+    execute_limit_order_for_user,
+)
 
 # Real-time copy trading tracker (WebSocket-based)
 try:
@@ -752,6 +757,124 @@ def _load_announcement_signals(path: str, max_count: int) -> list[Dict[str, Any]
         out.append(dict(obj))
     out.sort(key=lambda x: int(x.get("signal_ts") or 0), reverse=True)
     return out[:max_count]
+
+
+# Whale / insider indexer: thresholds (USD). Override via env.
+WHALE_USD_MIN = float(os.getenv("WHALE_INSIDER_WHALE_USD", "100000"))
+INSIDER_USD_MIN = float(os.getenv("WHALE_INSIDER_INSIDER_USD", "55000"))
+WHALE_INSIDER_PAGE_SIZE = int(os.getenv("WHALE_INSIDER_PAGE_SIZE", "100"))
+WHALE_INSIDER_MAX_PAGES = int(os.getenv("WHALE_INSIDER_MAX_PAGES", "20"))
+
+
+def _run_whale_insider_indexer_tick(db: DatabaseManager) -> None:
+    """
+    Indexer tick: page through Polymarket global trades and flag whale/insider trades.
+    Whales = single trade >= 100k USD. Insiders = new account (first time we see wallet) with trade >= 55k USD.
+    Runs until caught up (all trades since last_ts processed) or max pages reached.
+    """
+    last_ts = db.get_last_whale_daemon_ts()
+    page_size = max(50, min(500, WHALE_INSIDER_PAGE_SIZE))
+    max_pages = max(1, min(50, WHALE_INSIDER_MAX_PAGES))
+    total_processed = 0
+    total_flagged_whale = 0
+    total_flagged_insider = 0
+    max_ts = last_ts
+
+    for page in range(max_pages):
+        offset = page * page_size
+        try:
+            trades_raw = _fetch_pm_trades_global_sync(limit=page_size, offset=offset)
+        except Exception as e:
+            logging.getLogger(__name__).warning("[WHALE/INSIDER INDEXER] Fetch failed at offset %s: %s", offset, e)
+            break
+        if not isinstance(trades_raw, list):
+            trades_raw = getattr(trades_raw, "get", lambda _: [])(trades_raw) or []
+        if not trades_raw:
+            break
+
+        page_max_ts = last_ts
+        for t in trades_raw:
+            if not isinstance(t, dict):
+                continue
+            ts_raw = t.get("timestamp")
+            if ts_raw is None:
+                continue
+            ts = int(ts_raw)
+            if ts > 1e12:
+                ts = ts // 1000
+            if ts <= last_ts:
+                continue
+            total_processed += 1
+            if ts > page_max_ts:
+                page_max_ts = ts
+            if ts > max_ts:
+                max_ts = ts
+
+            wallet = (t.get("proxyWallet") or t.get("proxy_wallet") or t.get("user") or "").strip()
+            if not wallet:
+                continue
+            size_val = t.get("size")
+            price_val = t.get("price")
+            if size_val is None or price_val is None:
+                amount = t.get("amount")
+                if amount is not None:
+                    trade_usd = float(amount)
+                else:
+                    continue
+            else:
+                trade_usd = float(size_val) * float(price_val)
+            if trade_usd < INSIDER_USD_MIN:
+                continue
+
+            condition_id = t.get("conditionId") or t.get("condition_id") or ""
+            market_title = (t.get("title") or t.get("market_title") or "")[:255]
+            tx_hash = (t.get("transactionHash") or t.get("txHash") or t.get("transaction_hash") or "").strip() or None
+
+            if trade_usd >= WHALE_USD_MIN:
+                if db.insert_whale_insider_alert(
+                    wallet=wallet,
+                    kind="whale",
+                    trade_usd=trade_usd,
+                    executed_at=ts,
+                    condition_id=condition_id or None,
+                    market_title=market_title or None,
+                    tx_hash=tx_hash,
+                ):
+                    total_flagged_whale += 1
+                    logging.getLogger(__name__).info(
+                        "[WHALE/INSIDER INDEXER] Flagged whale: %s $%.0f", wallet[:12] + "...", trade_usd
+                    )
+
+            if trade_usd >= INSIDER_USD_MIN and not db.has_seen_whale_wallet(wallet):
+                db.ensure_seen_whale_wallet(wallet, ts)
+                if db.insert_whale_insider_alert(
+                    wallet=wallet,
+                    kind="insider",
+                    trade_usd=trade_usd,
+                    executed_at=ts,
+                    condition_id=condition_id or None,
+                    market_title=market_title or None,
+                    tx_hash=tx_hash,
+                ):
+                    total_flagged_insider += 1
+                    logging.getLogger(__name__).info(
+                        "[WHALE/INSIDER INDEXER] Flagged insider: %s $%.0f", wallet[:12] + "...", trade_usd
+                    )
+
+        if max_ts > last_ts:
+            db.set_last_whale_daemon_ts(max_ts)
+        if len(trades_raw) < page_size:
+            break
+        if page_max_ts <= last_ts:
+            break
+
+    if total_processed or total_flagged_whale or total_flagged_insider:
+        logging.getLogger(__name__).debug(
+            "[WHALE/INSIDER INDEXER] Processed %s trades, flagged %s whale, %s insider",
+            total_processed,
+            total_flagged_whale,
+            total_flagged_insider,
+        )
 
 
 def _compute_fractional_amount_for_hook(
@@ -1251,6 +1374,277 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
 
     @app.on_event("startup")
     async def _start_background_tasks():
+        # In-memory guard so concurrent strategies do not auto-trade multiple times
+        # for the same Polymarket series within its time window (e.g. 5m).
+        _signal_last_autotrade_ts: dict[str, int] = {}
+
+        def _signal_window_seconds(timeframe: str) -> int:
+            tf = (timeframe or "").strip().lower()
+            if tf.endswith("m"):
+                try:
+                    mins = int(tf[:-1])
+                    return max(0, mins) * 60
+                except Exception:
+                    return 0
+            return 0
+
+        def _signal_scope_key(payload: dict) -> str:
+            series_slug = (payload.get("series_slug") or "").strip()
+            series = (payload.get("series") or "").strip()
+            asset = (payload.get("asset") or "").strip()
+            tf = (payload.get("timeframe") or "").strip()
+            scope = (series_slug or series or asset or "market").strip().lower()
+            return f"{scope}:{tf.strip().lower()}"
+
+        async def _enqueue_outbox(user_id: int, kind: str, text: str) -> None:
+            now_ts = int(time.time())
+            try:
+                db.execute(
+                    """
+                    INSERT INTO signal_notifications_outbox (user_id, kind, text, created_at, sent_at)
+                    VALUES (?, ?, ?, ?, NULL);
+                    """,
+                    (int(user_id), str(kind), str(text), now_ts),
+                )
+            except Exception:
+                pass
+
+        async def _handle_autotrade_signal(payload: dict) -> None:
+            """
+            Execute signal auto-trades for opted-in users.
+            Triggered by the in-process Telegram listener callback.
+            """
+            try:
+                if not isinstance(payload, dict):
+                    return
+                if not payload.get("parsed"):
+                    return
+                if str(payload.get("source") or "") != "live:new":
+                    return
+                timeframe = (payload.get("timeframe") or "").strip().lower()
+                if timeframe != "5m":
+                    return
+
+                condition_id = (payload.get("condition_id") or "").strip()
+                end_ts = int(payload.get("end_ts") or 0)
+                side = (payload.get("signal") or "").strip().upper()
+                if not condition_id or end_ts <= 0 or side not in ("YES", "NO"):
+                    return
+
+                # Concurrency window: first signal wins for series+timeframe.
+                window = _signal_window_seconds(timeframe)
+                key = _signal_scope_key(payload)
+                now_ts = int(time.time())
+                last_ts = int(_signal_last_autotrade_ts.get(key) or 0)
+                signal_ts = int(payload.get("signal_ts") or 0) or now_ts
+                if window and last_ts and signal_ts < (last_ts + window):
+                    return
+                _signal_last_autotrade_ts[key] = signal_ts
+
+                rows = db.execute(
+                    """
+                    SELECT user_id, eth_address, signal_trade_amount_usd
+                    FROM users
+                    WHERE signal_trading_enabled = 1 AND COALESCE(signal_trade_amount_usd, 0) > 0;
+                    """
+                ).fetchall()
+                if not rows:
+                    return
+
+                # Execute per user; isolate failures.
+                for r in rows:
+                    try:
+                        uid = int(r["user_id"])
+                        amount_usd = float(r["signal_trade_amount_usd"] or 0.0)
+                        if amount_usd <= 0:
+                            continue
+
+                        created_at = int(time.time())
+                        # Create job (idempotent by UNIQUE constraint).
+                        try:
+                            db.execute(
+                                """
+                                INSERT INTO signal_autotrade_jobs (
+                                    user_id, series_slug, series, event_slug, condition_id, timeframe,
+                                    signal, signal_ts, end_ts, status, order_id, tx_hash, error,
+                                    created_at, updated_at
+                                )
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?);
+                                """,
+                                (
+                                    uid,
+                                    (payload.get("series_slug") or None),
+                                    (payload.get("series") or None),
+                                    (payload.get("event_slug") or None),
+                                    condition_id,
+                                    timeframe,
+                                    side,
+                                    signal_ts,
+                                    end_ts,
+                                    "queued",
+                                    created_at,
+                                    created_at,
+                                ),
+                            )
+                        except Exception:
+                            # Already exists (or schema mismatch); do not duplicate.
+                            pass
+
+                        # Execute immediately (time critical) using existing safe-aware trading logic.
+                        result_text = await asyncio.to_thread(
+                            execute_trade_for_user,
+                            db,
+                            uid,
+                            side,
+                            amount_usd,
+                            condition_id,
+                        )
+                        parsed = _parse_trade_result(result_text or "")
+                        ok = bool(parsed.get("success"))
+                        order_id = parsed.get("order_id")
+                        tx_hash = parsed.get("tx_hash")
+
+                        status = "traded" if ok else "failed"
+                        err = None if ok else (parsed.get("raw") or "trade failed")
+                        try:
+                            db.execute(
+                                """
+                                UPDATE signal_autotrade_jobs
+                                SET status = ?, order_id = ?, tx_hash = ?, error = ?, updated_at = ?
+                                WHERE user_id = ? AND condition_id = ? AND signal_ts = ?;
+                                """,
+                                (
+                                    status,
+                                    order_id,
+                                    tx_hash,
+                                    err,
+                                    int(time.time()),
+                                    uid,
+                                    condition_id,
+                                    signal_ts,
+                                ),
+                            )
+                        except Exception:
+                            pass
+
+                        # Outbox notification for user.
+                        series_title = (payload.get("series") or payload.get("series_slug") or "signal market")
+                        if ok:
+                            await _enqueue_outbox(
+                                uid,
+                                "signal_trade_placed",
+                                f"Auto-trade placed ({timeframe.upper()}): {side} on {series_title}",
+                            )
+                        else:
+                            await _enqueue_outbox(
+                                uid,
+                                "signal_trade_failed",
+                                f"Auto-trade failed ({timeframe.upper()}): {side} on {series_title}",
+                            )
+                    except Exception:
+                        continue
+            except Exception:
+                return
+
+        async def _signal_resolution_scheduler_loop() -> None:
+            """
+            After end_ts (+grace), classify win/loss and auto-claim for signal trades.
+            """
+            grace_sec = max(30, int(float(os.getenv("SIGNAL_RESOLUTION_GRACE_SEC", "60") or "60")))
+            interval = max(5.0, float(os.getenv("SIGNAL_RESOLUTION_INTERVAL_SEC", "10") or "10"))
+
+            def _fetch_closed_positions_for_user_wallet(wallet: str) -> list[dict]:
+                try:
+                    url = f"https://data-api.polymarket.com/closed-positions?user={wallet}&limit=50"
+                    resp = requests.get(url, timeout=10)
+                    data = resp.json() if resp.status_code == 200 else []
+                    return data if isinstance(data, list) else []
+                except Exception:
+                    return []
+
+            from bot_tools import get_trading_wallet_address as _get_trading_wallet
+            import bot_tools as _bot_tools
+
+            while True:
+                try:
+                    now_ts = int(time.time())
+                    rows = db.execute(
+                        """
+                        SELECT j.id, j.user_id, j.condition_id, j.end_ts, j.timeframe, j.signal, j.series, j.series_slug, u.eth_address
+                        FROM signal_autotrade_jobs j
+                        LEFT JOIN users u ON u.user_id = j.user_id
+                        WHERE j.status IN ('traded', 'queued') AND j.end_ts <= ?
+                        ORDER BY j.end_ts ASC
+                        LIMIT 50;
+                        """,
+                        (now_ts - grace_sec,),
+                    ).fetchall()
+                    if not rows:
+                        await asyncio.sleep(interval)
+                        continue
+
+                    for r in rows:
+                        try:
+                            jid = int(r["id"])
+                            uid = int(r["user_id"])
+                            cid = (r["condition_id"] or "").strip()
+                            eth_address = (r["eth_address"] or "").strip()
+                            if not cid or not eth_address:
+                                db.execute(
+                                    "UPDATE signal_autotrade_jobs SET status = ?, updated_at = ? WHERE id = ?;",
+                                    ("failed", int(time.time()), jid),
+                                )
+                                continue
+
+                            trading_wallet = _get_trading_wallet(eth_address) or eth_address
+                            closed = await asyncio.to_thread(_fetch_closed_positions_for_user_wallet, trading_wallet)
+                            pos = next(
+                                (
+                                    p for p in closed
+                                    if str(p.get("conditionId") or p.get("condition_id") or "").strip().lower() == cid.lower()
+                                ),
+                                None,
+                            )
+                            # If not yet in closed positions, skip until next tick.
+                            if not pos:
+                                continue
+
+                            pnl = None
+                            for k in ("cashPnl", "cash_pnl", "pnl", "realizedPnl", "realized_pnl"):
+                                if k in pos:
+                                    try:
+                                        pnl = float(pos.get(k) or 0.0)
+                                        break
+                                    except Exception:
+                                        pnl = None
+                            win = pnl is not None and pnl > 0
+                            series_title = (r["series"] or r["series_slug"] or "signal market")
+                            tf = (r["timeframe"] or "").strip().upper() or "5M"
+
+                            await _enqueue_outbox(
+                                uid,
+                                "signal_resolved_win" if win else "signal_resolved_loss",
+                                f"Signal resolved ({tf}) on {series_title}: {'WIN' if win else 'LOSS'}",
+                            )
+
+                            # Auto-claim winnings (gasless); safe to call even if none.
+                            claim_res = await asyncio.to_thread(_bot_tools.claim_polymarket_winnings, eth_address)
+                            await _enqueue_outbox(
+                                uid,
+                                "signal_claimed",
+                                f"Auto-claim: {strip_emoji(str(claim_res or 'done'))}",
+                            )
+
+                            db.execute(
+                                "UPDATE signal_autotrade_jobs SET status = ?, updated_at = ? WHERE id = ?;",
+                                ("claimed", int(time.time()), jid),
+                            )
+                        except Exception:
+                            continue
+
+                except Exception as e:
+                    logging.getLogger(__name__).warning("[SIGNAL RESOLUTION] loop error: %s", e)
+                await asyncio.sleep(interval)
         # Initialize copy trading schema
         if COPY_TRACKER_AVAILABLE:
             try:
@@ -1293,8 +1687,18 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                     logging.getLogger(__name__).info(
                         "[TELEGRAM SIGNAL LISTENER] Starting API daemon (latest + time-accurate data for /me/copy-trading/notifications)"
                     )
-                    # Push each new signal into buffer so notifications endpoint has latest without re-read delay.
-                    await run_listener(cfg, on_signal=lambda p: _ANNOUNCEMENT_SIGNALS_BUFFER.append(p))
+                    def _on_signal(p: dict) -> None:
+                        try:
+                            _ANNOUNCEMENT_SIGNALS_BUFFER.append(p)
+                        except Exception:
+                            pass
+                        try:
+                            loop = asyncio.get_running_loop()
+                            loop.create_task(_handle_autotrade_signal(dict(p) if isinstance(p, dict) else {}))
+                        except Exception:
+                            pass
+
+                    await run_listener(cfg, on_signal=_on_signal)
                 except Exception as e:
                     logging.getLogger(__name__).warning(
                         "[TELEGRAM SIGNAL LISTENER] Daemon failed or stopped: %s. Set TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SIGNAL_CHAT and run scripts/telegram_announcement_listener.py once to log in.",
@@ -1302,9 +1706,58 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                     )
             asyncio.create_task(_telegram_signal_listener_loop())
 
+        # Scheduler for signal resolution, win/loss, and auto-claim.
+        try:
+            asyncio.create_task(_signal_resolution_scheduler_loop())
+        except Exception as e:
+            logging.getLogger(__name__).warning("[SIGNAL RESOLUTION] Failed to start loop: %s", e)
+
+        # Whale / insider indexer: scan Polymarket global trades and flag large bets (whale >= 100k, insider new account >= 55k).
+        if os.getenv("DISABLE_WHALE_INSIDER_DAEMON", "").strip().lower() not in ("1", "true", "yes"):
+            async def _whale_insider_indexer_loop() -> None:
+                interval = max(30.0, float(os.getenv("WHALE_INSIDER_INTERVAL_SEC", "60") or "60"))
+                while True:
+                    try:
+                        await asyncio.to_thread(_run_whale_insider_indexer_tick, db)
+                    except Exception as e:
+                        logging.getLogger(__name__).warning("[WHALE/INSIDER INDEXER] Tick error: %s", e)
+                    await asyncio.sleep(interval)
+            logging.getLogger(__name__).info(
+                "[WHALE/INSIDER INDEXER] Started (global Polymarket; whale>=%s USD, insider>=%s USD)",
+                WHALE_USD_MIN,
+                INSIDER_USD_MIN,
+            )
+            asyncio.create_task(_whale_insider_indexer_loop())
+
     @app.get("/health", tags=["system"], summary="Health check")
     async def health():
         return {"status": "ok"}
+
+    @app.get(
+        "/indexer/whale-insider",
+        tags=["indexer"],
+        summary="List indexed whale and insider trades",
+    )
+    async def get_whale_insider_index(
+        limit: int = Query(100, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+        kind: str | None = Query(None, description="Filter: 'whale' or 'insider'"),
+    ):
+        """
+        Return the index of flagged whale/insider trades from the global Polymarket scan.
+        Whale = single trade >= 100k USD. Insider = new account with trade >= 55k USD.
+        """
+        items = db.get_whale_insider_index(limit=limit, offset=offset, kind=kind)
+        return {"flags": items, "limit": limit, "offset": offset, "kind": kind}
+
+    @app.get(
+        "/indexer/whale-insider/stats",
+        tags=["indexer"],
+        summary="Whale/insider indexer stats",
+    )
+    async def get_whale_insider_index_stats():
+        """Return counts and last indexed timestamp for the whale/insider indexer."""
+        return db.get_whale_insider_stats()
 
     @app.post(
         "/admin/trades/flush-invalid",
@@ -2111,7 +2564,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
     @app.get(
         "/me/copy-trading/notifications",
         tags=["copy-trading"],
-        summary="Recent copy-trade executions for current user",
+        summary="Merged notifications (copy-trades + signal-trades) for current user",
     )
     async def get_copy_trading_notifications(
         limit: int = 20,
@@ -2164,100 +2617,131 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
 
         notifications: list[Dict[str, Any]] = []
 
-        # Notifications = hook_log for this user only (WebSocket copy tracker executions).
+        # 1) Copy-trade notifications: successful copied trades for this user.
         try:
-            hook_rows = db.execute(
+            trade_rows = db.execute(
                 """
                 SELECT
-                    executed_at,
+                    id,
+                    market_id,
                     condition_id,
-                    trade_side,
-                    trade_outcome,
-                    trade_price,
-                    trade_size,
-                    follower_amount,
+                    side,
+                    amount,
+                    size,
+                    price,
+                    order_side,
                     status,
-                    error_message,
-                    leader_address,
-                    hook_id,
-                    market_title
-                FROM hook_logs
-                WHERE follower_user_id = ?
+                    tx_hash,
+                    executed_at,
+                    copied_from_user_id
+                FROM trades
+                WHERE user_id = ? AND copied_from_user_id IS NOT NULL
                 ORDER BY executed_at DESC
                 LIMIT ?;
                 """,
-                (user["user_id"], limit),
+                (user["user_id"], limit * 2),
             ).fetchall()
-            for r in hook_rows:
+            for r in trade_rows:
                 d = dict(r)
-                ts = d.get("executed_at")
-                ts_display = datetime.utcfromtimestamp(ts).isoformat() + "Z" if ts is not None else None
+                ts = int(d.get("executed_at") or 0)
+                if ts <= 0:
+                    continue
+                st = (d.get("status") or "").strip().lower()
+                if st in ("error", "failed", "cancelled"):
+                    continue
+                ts_display = datetime.utcfromtimestamp(ts).isoformat() + "Z"
                 notifications.append(
                     {
-                        "source": "hook_log",
+                        "source": "copy_trade",
+                        "kind": "copy_trade_executed",
                         "executed_at": ts,
                         "timestamp": ts_display,
-                        "market_id": None,
+                        "market_id": d.get("market_id"),
                         "condition_id": d.get("condition_id"),
-                        "side": d.get("trade_outcome"),
-                        "amount": float(d.get("follower_amount") or 0.0),
-                        "size": float(d.get("trade_size") or 0.0) if d.get("trade_size") is not None else None,
-                        "price": float(d.get("trade_price") or 0.0) if d.get("trade_price") is not None else None,
-                        "order_side": d.get("trade_side"),
+                        "side": d.get("side"),
+                        "amount": float(d.get("amount") or 0.0),
+                        "size": float(d.get("size") or 0.0) if d.get("size") is not None else None,
+                        "price": float(d.get("price") or 0.0) if d.get("price") is not None else None,
+                        "order_side": d.get("order_side"),
                         "status": d.get("status"),
-                        "tx_hash": None,
-                        "leader_user_id": None,
-                        "leader_username": None,
-                        "leader_address": d.get("leader_address"),
-                        "hook_id": d.get("hook_id"),
-                        "error_message": d.get("error_message"),
-                        "market_title": d.get("market_title"),
+                        "tx_hash": d.get("tx_hash"),
+                        "leader_user_id": d.get("copied_from_user_id"),
                     }
                 )
         except Exception:
             pass
 
-        # Announcement signals from scripts/telegram_announcement_listener.py (JSONL).
-        signal_path = os.getenv("TELEGRAM_SIGNAL_OUTPUT", "logs/announcement_signals.jsonl")
-        for sig in _load_announcement_signals(signal_path, limit * 2):
-            signal_ts = int(sig.get("signal_ts") or 0)
-            # Timestamp for display: prefer "21:40 UTC", else ISO, else from executed_at.
-            timestamp_display = (
-                sig.get("time_utc_display")
-                or sig.get("signal_at")
-                or (datetime.utcfromtimestamp(signal_ts).isoformat() + "Z" if signal_ts else None)
-            )
-            notifications.append(
-                {
-                    "source": "announcement_signal",
-                    "executed_at": signal_ts,
-                    "timestamp": timestamp_display,  # signal time for display, e.g. "21:40 UTC"
-                    "market_id": None,
-                    "condition_id": None,
-                    "side": sig.get("signal"),  # YES | NO
-                    "amount": None,
-                    "size": None,
-                    "price": None,
-                    "order_side": "BUY",
-                    "status": "signal",
-                    "tx_hash": None,
-                    "leader_user_id": None,
-                    "leader_username": None,
-                    "leader_address": None,
-                    "hook_id": None,
-                    "error_message": None,
-                    "market_title": sig.get("market"),
-                    "timeframe": sig.get("timeframe"),
-                    "market_end_ts": sig.get("market_end_ts"),
-                    "market_end_at": sig.get("market_end_at"),
-                    "asset": sig.get("asset"),
-                    "direction": sig.get("direction"),
-                    "confidence_pct": sig.get("confidence_pct"),
-                    "chat_title": sig.get("chat_title"),
-                    "signal_at": sig.get("signal_at"),
-                    "time_utc_display": sig.get("time_utc_display"),  # e.g. "21:40 UTC"
-                }
-            )
+        # 2) Signal-trade notifications (API outbox + bot delivery).
+        try:
+            out_rows = db.execute(
+                """
+                SELECT id, kind, text, created_at, sent_at
+                FROM signal_notifications_outbox
+                WHERE user_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?;
+                """,
+                (user["user_id"], limit * 3),
+            ).fetchall()
+            for r in out_rows:
+                d = dict(r)
+                ts = int(d.get("created_at") or 0)
+                ts_display = datetime.utcfromtimestamp(ts).isoformat() + "Z" if ts else None
+                notifications.append(
+                    {
+                        "source": "signal_trade",
+                        "kind": d.get("kind"),
+                        "executed_at": ts,
+                        "timestamp": ts_display,
+                        "message": d.get("text"),
+                        "sent_at": d.get("sent_at"),
+                    }
+                )
+        except Exception:
+            pass
+
+        # Raw announcement signals are intentionally not included here; signal trading
+        # actions are surfaced via the signal_trade outbox above.
+
+        # Whale / insider alerts (two flags: whale and insider).
+        try:
+            for a in db.get_recent_whale_insider_alerts(limit=limit * 2):
+                ts = int(a.get("executed_at") or 0)
+                kind = (a.get("kind") or "").strip().lower()
+                trade_usd = float(a.get("trade_usd") or 0)
+                market_title = (a.get("market_title") or "").strip()
+                market_ref = market_title if market_title else "this market"
+                amount_str = f"${trade_usd:,.0f}"
+                if kind == "whale":
+                    message = f"Whale alert: Someone just placed a position of {amount_str} on {market_ref}"
+                elif kind == "insider":
+                    message = f"Insider alert: Someone just placed a position of {amount_str} on {market_ref}"
+                else:
+                    message = f"Alert: Someone just placed a position of {amount_str} on {market_ref}"
+                notifications.append(
+                    {
+                        "source": "whale_insider",
+                        "executed_at": ts,
+                        "timestamp": datetime.utcfromtimestamp(ts).isoformat() + "Z" if ts else None,
+                        "kind": a.get("kind"),  # "whale" | "insider"
+                        "message": message,
+                        "wallet": a.get("wallet"),
+                        "trade_usd": trade_usd,
+                        "condition_id": a.get("condition_id"),
+                        "market_title": a.get("market_title"),
+                        "tx_hash": a.get("tx_hash"),
+                        "market_id": None,
+                        "side": None,
+                        "amount": trade_usd,
+                        "size": None,
+                        "price": None,
+                        "order_side": None,
+                        "status": a.get("kind"),
+                        "leader_address": a.get("wallet"),
+                    }
+                )
+        except Exception:
+            pass
 
         notifications.sort(key=lambda n: int(n.get("executed_at") or 0), reverse=True)
         notifications = notifications[:limit]
@@ -2266,6 +2750,117 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
             "notifications": notifications,
             "limit": limit,
         }
+
+    # ── Signal trading endpoints (user-only, session auth) ──
+
+    @app.get(
+        "/me/signal-trading/settings",
+        tags=["signal-trading"],
+        summary="Get signal auto-trading settings for current user",
+    )
+    async def get_signal_trading_settings(current=Depends(_get_current_session)):
+        user = db.get_user(current["user_id"])
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found.")
+        from bot_tools import get_trading_wallet_address
+
+        trading_wallet = get_trading_wallet_address(user.get("eth_address") or "")
+        return {
+            "enabled": bool(user.get("signal_trading_enabled") or 0),
+            "amount_usd": float(user.get("signal_trade_amount_usd") or 0.0),
+            "wallet": user.get("eth_address"),
+            "trading_wallet": trading_wallet,
+        }
+
+    class SignalTradingSettingsRequest(BaseModel):
+        enabled: bool | None = None
+        amount_usd: float | None = None
+
+    @app.post(
+        "/me/signal-trading/settings",
+        tags=["signal-trading"],
+        summary="Update signal auto-trading settings for current user",
+    )
+    async def set_signal_trading_settings(
+        body: SignalTradingSettingsRequest,
+        current=Depends(_get_current_session),
+    ):
+        user = db.get_user(current["user_id"])
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found.")
+
+        enabled = body.enabled
+        amount = body.amount_usd
+        if amount is not None:
+            try:
+                amount = float(amount)
+            except Exception:
+                raise HTTPException(status_code=400, detail="amount_usd must be a number.")
+            if amount < 0:
+                raise HTTPException(status_code=400, detail="amount_usd must be >= 0.")
+            if amount > 1000:
+                raise HTTPException(status_code=400, detail="amount_usd too large.")
+
+        with db.transaction() as conn:
+            if enabled is not None:
+                conn.execute(
+                    "UPDATE users SET signal_trading_enabled = ? WHERE user_id = ?;",
+                    (1 if enabled else 0, user["user_id"]),
+                )
+            if amount is not None:
+                conn.execute(
+                    "UPDATE users SET signal_trade_amount_usd = ? WHERE user_id = ?;",
+                    (amount, user["user_id"]),
+                )
+
+        user2 = db.get_user(user["user_id"]) or {}
+        return {
+            "enabled": bool(user2.get("signal_trading_enabled") or 0),
+            "amount_usd": float(user2.get("signal_trade_amount_usd") or 0.0),
+        }
+
+    @app.get(
+        "/me/signal-trading/jobs",
+        tags=["signal-trading"],
+        summary="List recent signal auto-trade jobs for current user",
+    )
+    async def list_signal_trading_jobs(
+        limit: int = Query(50, ge=1, le=200),
+        current=Depends(_get_current_session),
+    ):
+        user = db.get_user(current["user_id"])
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found.")
+        rows = db.execute(
+            """
+            SELECT
+                id, series_slug, series, event_slug, condition_id, timeframe, signal,
+                signal_ts, end_ts, status, order_id, tx_hash, error, created_at, updated_at
+            FROM signal_autotrade_jobs
+            WHERE user_id = ?
+            ORDER BY signal_ts DESC
+            LIMIT ?;
+            """,
+            (user["user_id"], limit),
+        ).fetchall()
+        return {"jobs": [dict(r) for r in rows], "count": len(rows)}
+
+    @app.post(
+        "/me/signal-trading/claim-latest",
+        tags=["signal-trading"],
+        summary="Claim winnings (gasless) for current user",
+    )
+    async def claim_latest_for_signal_trading(current=Depends(_get_current_session_for_trading)):
+        user = db.get_user(current["user_id"])
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found.")
+        address = user.get("eth_address") or ""
+        if not address:
+            raise HTTPException(status_code=400, detail="User has no wallet address.")
+        import bot_tools as _bot_tools
+
+        result_text = await asyncio.to_thread(_bot_tools.claim_polymarket_winnings, address)
+        return {"wallet": address, "result": strip_emoji(str(result_text or ""))}
 
     class FollowRequest(BaseModel):
         """Request body for following a copy trading leader."""
@@ -4203,11 +4798,15 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
     def _parse_trade_result(raw: str) -> Dict[str, Any]:
         """
         Parse the human-readable trade result string from execute_trade_for_user
-        into a structured dict we can use for status checks and copy trading.
+        or execute_limit_order_for_user into a structured dict for status and copy trading.
         """
         raw = strip_emoji(raw or "")
-        success = raw.startswith("✅") or "TRADE EXECUTED" in raw
-        failure = "TRADE FAILED" in raw
+        success = (
+            raw.startswith("✅")
+            or "TRADE EXECUTED" in raw
+            or "LIMIT ORDER PLACED" in raw
+        )
+        failure = "TRADE FAILED" in raw or "LIMIT ORDER FAILED" in raw
         order_id: str | None = None
         status_str: str | None = None
         tx_hash: str | None = None
@@ -4219,13 +4818,17 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                 status_str = line.split(":", 1)[1].strip()
             elif line.startswith("TX Hash:"):
                 tx_hash = line.split(":", 1)[1].strip()
+        # Limit order with status "matched" is success even if emoji was stripped
+        if (status_str or "").lower() == "matched" and order_id:
+            success = True
+            failure = False
         return {
             "raw": raw,
             "success": bool(success and not failure),
             "failure": failure,
-            "order_id": order_id,
+            "order_id": str(order_id).strip() if order_id else None,
             "status": status_str,
-            "tx_hash": tx_hash,
+            "tx_hash": str(tx_hash).strip() if tx_hash else None,
         }
 
     async def _fire_copy_hooks(
@@ -4352,8 +4955,11 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
             for o in orders:
                 if not isinstance(o, dict):
                     continue
-                oid = o.get("id") or o.get("orderID") or o.get("order_id")
-                if str(oid) != str(leader_order_id):
+                oid = (
+                    o.get("orderID") or o.get("orderId") or o.get("order_id")
+                    or o.get("id") or o.get("hash")
+                )
+                if not oid or str(oid) != str(leader_order_id):
                     continue
                 leader_token_id = (
                     o.get("token_id")
@@ -4396,7 +5002,10 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                     continue
                 if leader_side and side and side != leader_side:
                     continue
-                oid = o.get("id") or o.get("orderID") or o.get("order_id")
+                oid = (
+                    o.get("orderID") or o.get("orderId") or o.get("order_id")
+                    or o.get("id") or o.get("hash")
+                )
                 if not oid:
                     continue
                 # Best-effort cancel; ignore failures.
@@ -5140,45 +5749,79 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
     @app.get(
         "/me/orders",
         tags=["trading"],
-        summary="List open CLOB orders for current user",
+        summary="List open (cancelable) limit orders for current user",
     )
     async def get_my_open_orders(current=Depends(_get_current_session)):
         """
-        Get your open (resting) orders on Polymarket. Use the 'order_id' (or 'id') of
-        each order in POST /trade/cancel to cancel it. Filled trades in /me/portfolio
-        do not have an order_id for cancellation (they are already executed).
+        Get only **untouched** open orders that can be cancelled.
+        Excludes matched/filled orders; only shows resting orders (status: live, delayed, unmatched).
         """
+        # CLOB order statuses: live = resting, delayed/unmatched = on book; matched = already filled
+        NON_CANCELABLE_STATUSES = frozenset({"matched"})
+
         user = db.get_user(current["user_id"])
         if not user:
             raise HTTPException(status_code=404, detail="User not found.")
 
-        resp = get_open_orders_for_user(db=db, user_id=user["user_id"])
-        if resp is None:
-            raise HTTPException(
-                status_code=502,
-                detail="Failed to fetch open orders from Polymarket.",
-            )
+        open_resp = get_open_orders_for_user(db=db, user_id=user["user_id"])
+        open_list: list[Dict[str, Any]] = []
+        if open_resp is not None:
+            data = open_resp if isinstance(open_resp, list) else (open_resp.get("data") or [])
+            for o in data:
+                if not isinstance(o, dict):
+                    continue
+                status = (o.get("status") or o.get("orderStatus") or o.get("order_status") or "").strip().lower()
+                if status in NON_CANCELABLE_STATUSES:
+                    continue
+                oid = (
+                    o.get("orderID") or o.get("orderId") or o.get("order_id")
+                    or o.get("id") or o.get("hash")
+                )
+                oid = str(oid).strip() if oid else None
+                ts = o.get("created_at") or o.get("timestamp") or o.get("updated_at") or 0
+                open_list.append({"order_id": oid, "state": "open", "_ts": int(ts) if ts else 0, **o})
 
-        # Normalize: CLOB returns data/next_cursor/count; ensure each order has order_id
-        data = resp.get("data") if isinstance(resp, dict) else []
-        if not isinstance(data, list):
-            data = []
-        orders = []
-        for o in data:
-            if isinstance(o, dict):
-                order_id = o.get("id") or o.get("orderID") or o.get("order_id")
-                orders.append({"order_id": order_id, **o})
-            else:
-                orders.append(o)
+        open_list.sort(key=lambda x: x.get("_ts") or 0, reverse=True)
+        for o in open_list:
+            o.pop("_ts", None)
 
         return {
-            "orders": orders,
-            "next_cursor": resp.get("next_cursor", "") if isinstance(resp, dict) else "",
-            "count": len(orders),
+            "orders": open_list,
+            "count": len(open_list),
         }
 
     class CancelRequest(BaseModel):
         order_id: str
+
+    @app.post(
+        "/cancel-order",
+        tags=["trading"],
+        summary="Cancel an open order by order_id",
+    )
+    async def cancel_order(body: CancelRequest, current=Depends(_get_current_session)):
+        """
+        Cancel an open Polymarket order.
+
+        - **order_id**: From GET /me/orders (open orders only).
+        """
+        user = db.get_user(current["user_id"])
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found.")
+        result = cancel_order_for_user(
+            db=db,
+            user_id=user["user_id"],
+            order_id=body.order_id,
+        )
+        try:
+            asyncio.create_task(
+                _propagate_cancel_to_followers(
+                    leader_user_id=user["user_id"],
+                    leader_order_id=body.order_id,
+                )
+            )
+        except Exception:
+            pass
+        return {"order_id": body.order_id, "result": strip_emoji(result)}
 
     @app.post(
         "/trade/cancel",
@@ -5194,14 +5837,11 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         user = db.get_user(current["user_id"])
         if not user:
             raise HTTPException(status_code=404, detail="User not found.")
-
         result = cancel_order_for_user(
             db=db,
             user_id=user["user_id"],
             order_id=body.order_id,
         )
-
-        # Best-effort: propagate this cancel to followers who have hooks for this leader.
         try:
             asyncio.create_task(
                 _propagate_cancel_to_followers(
@@ -5211,11 +5851,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
             )
         except Exception:
             pass
-
-        return {
-            "order_id": body.order_id,
-            "result": strip_emoji(result),
-        }
+        return {"order_id": body.order_id, "result": strip_emoji(result)}
 
     class AnalyzeMarketRequest(BaseModel):
         query: str

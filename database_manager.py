@@ -324,6 +324,21 @@ class DatabaseManager:
             except sqlite3.OperationalError:
                 pass
 
+            # ── Signal trading (auto-trade from series signals) ──
+            # Opt-in flag + per-user amount. Default OFF.
+            try:
+                conn.execute(
+                    "ALTER TABLE users ADD COLUMN signal_trading_enabled INTEGER DEFAULT 0;"
+                )
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute(
+                    "ALTER TABLE users ADD COLUMN signal_trade_amount_usd REAL DEFAULT 0;"
+                )
+            except sqlite3.OperationalError:
+                pass
+
             # Global trade feed table for social/copy trading.
             conn.execute(
                 """
@@ -342,6 +357,59 @@ class DatabaseManager:
                 );
                 """
             )
+
+            # One row per user per signal auto-trade.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS signal_autotrade_jobs (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id     INTEGER NOT NULL,
+                    series_slug TEXT,
+                    series      TEXT,
+                    event_slug  TEXT,
+                    condition_id TEXT NOT NULL,
+                    timeframe   TEXT,
+                    signal      TEXT,
+                    signal_ts   INTEGER NOT NULL,
+                    end_ts      INTEGER NOT NULL,
+                    status      TEXT NOT NULL,
+                    order_id    TEXT,
+                    tx_hash     TEXT,
+                    error       TEXT,
+                    created_at  INTEGER NOT NULL,
+                    updated_at  INTEGER NOT NULL,
+                    UNIQUE(user_id, condition_id, signal_ts),
+                    FOREIGN KEY (user_id) REFERENCES users(user_id)
+                );
+                """
+            )
+            try:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_signal_autotrade_jobs_due ON signal_autotrade_jobs(end_ts, status);"
+                )
+            except sqlite3.OperationalError:
+                pass
+
+            # Outbox for Telegram notifications (bot delivers and marks sent).
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS signal_notifications_outbox (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id     INTEGER NOT NULL,
+                    kind        TEXT NOT NULL,
+                    text        TEXT NOT NULL,
+                    created_at  INTEGER NOT NULL,
+                    sent_at     INTEGER,
+                    FOREIGN KEY (user_id) REFERENCES users(user_id)
+                );
+                """
+            )
+            try:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_signal_notifications_outbox_unsent ON signal_notifications_outbox(sent_at, created_at);"
+                )
+            except sqlite3.OperationalError:
+                pass
 
             # Optional column for order_id if upgrading an existing DB.
             try:
@@ -510,6 +578,45 @@ class DatabaseManager:
                     )
                     conn.execute("DROP TABLE hook_logs;")
                     conn.execute("ALTER TABLE hook_logs_new RENAME TO hook_logs;")
+            except sqlite3.OperationalError:
+                pass
+
+            # Whale / insider detection daemon: alerts and last processed timestamp.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS whale_insider_alerts (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    wallet       TEXT NOT NULL,
+                    kind         TEXT NOT NULL,
+                    trade_usd    REAL NOT NULL,
+                    condition_id TEXT,
+                    market_title TEXT,
+                    tx_hash      TEXT,
+                    executed_at  INTEGER NOT NULL,
+                    created_at   INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS whale_insider_seen_wallets (
+                    wallet       TEXT PRIMARY KEY,
+                    first_seen_at INTEGER NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS whale_insider_daemon_state (
+                    key   TEXT PRIMARY KEY,
+                    value INTEGER NOT NULL
+                );
+                """
+            )
+            try:
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS whale_insider_alerts_tx_kind ON whale_insider_alerts(tx_hash, kind) WHERE tx_hash != '' AND tx_hash IS NOT NULL;"
+                )
             except sqlite3.OperationalError:
                 pass
 
@@ -712,6 +819,140 @@ class DatabaseManager:
                 ),
             )
 
+    # ── Whale / insider detection daemon ─────────────────────────────────────
+
+    def get_last_whale_daemon_ts(self) -> int:
+        """Return last processed trade timestamp for whale/insider daemon."""
+        row = self.execute(
+            "SELECT value FROM whale_insider_daemon_state WHERE key = ?;",
+            ("last_ts",),
+        ).fetchone()
+        return int(row["value"]) if row else 0
+
+    def set_last_whale_daemon_ts(self, ts: int) -> None:
+        """Set last processed trade timestamp for whale/insider daemon."""
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO whale_insider_daemon_state (key, value) VALUES (?, ?);",
+                ("last_ts", ts),
+            )
+
+    def has_seen_whale_wallet(self, wallet: str) -> bool:
+        """Return True if we have already seen this wallet (for insider = new-account check)."""
+        wallet = (wallet or "").strip().lower()
+        if not wallet:
+            return True
+        row = self.execute(
+            "SELECT 1 FROM whale_insider_seen_wallets WHERE wallet = ? LIMIT 1;",
+            (wallet,),
+        ).fetchone()
+        return row is not None
+
+    def ensure_seen_whale_wallet(self, wallet: str, first_seen_at: int) -> None:
+        """Record that we have seen this wallet (so future large trades are whale, not insider)."""
+        wallet = (wallet or "").strip().lower()
+        if not wallet:
+            return
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO whale_insider_seen_wallets (wallet, first_seen_at) VALUES (?, ?);",
+                (wallet, first_seen_at),
+            )
+
+    def insert_whale_insider_alert(
+        self,
+        wallet: str,
+        kind: str,
+        trade_usd: float,
+        executed_at: int,
+        condition_id: str | None = None,
+        market_title: str | None = None,
+        tx_hash: str | None = None,
+    ) -> bool:
+        """Insert a whale or insider alert (indexed flag). kind must be 'whale' or 'insider'. Returns True if inserted."""
+        wallet = (wallet or "").strip()
+        if not wallet or kind not in ("whale", "insider"):
+            return False
+        tx_hash = (tx_hash or "").strip() or ""
+        with self.transaction() as conn:
+            if tx_hash:
+                existing = conn.execute(
+                    "SELECT 1 FROM whale_insider_alerts WHERE tx_hash = ? AND kind = ? LIMIT 1;",
+                    (tx_hash, kind),
+                ).fetchone()
+                if existing:
+                    return False
+            conn.execute(
+                """
+                INSERT INTO whale_insider_alerts (wallet, kind, trade_usd, condition_id, market_title, tx_hash, executed_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'));
+                """,
+                (wallet, kind, trade_usd, condition_id or "", (market_title or "")[:255], tx_hash, executed_at),
+            )
+            return True
+
+    def get_recent_whale_insider_alerts(self, limit: int = 50) -> list[dict]:
+        """Return recent whale/insider alerts for notifications, newest first."""
+        rows = self.execute(
+            """
+            SELECT wallet, kind, trade_usd, condition_id, market_title, tx_hash, executed_at, created_at
+            FROM whale_insider_alerts
+            ORDER BY executed_at DESC
+            LIMIT ?;
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_whale_insider_index(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        kind: str | None = None,
+    ) -> list[dict]:
+        """Return indexed whale/insider flags (paginated). kind: None = all, 'whale' or 'insider'."""
+        if kind and kind not in ("whale", "insider"):
+            kind = None
+        if limit < 1:
+            limit = 1
+        if limit > 500:
+            limit = 500
+        if offset < 0:
+            offset = 0
+        if kind:
+            rows = self.execute(
+                """
+                SELECT id, wallet, kind, trade_usd, condition_id, market_title, tx_hash, executed_at, created_at
+                FROM whale_insider_alerts
+                WHERE kind = ?
+                ORDER BY executed_at DESC
+                LIMIT ? OFFSET ?;
+                """,
+                (kind, limit, offset),
+            ).fetchall()
+        else:
+            rows = self.execute(
+                """
+                SELECT id, wallet, kind, trade_usd, condition_id, market_title, tx_hash, executed_at, created_at
+                FROM whale_insider_alerts
+                ORDER BY executed_at DESC
+                LIMIT ? OFFSET ?;
+                """,
+                (limit, offset),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_whale_insider_stats(self) -> dict:
+        """Return counts for the whale/insider index."""
+        whale = self.execute("SELECT COUNT(*) AS n FROM whale_insider_alerts WHERE kind = 'whale';").fetchone()
+        insider = self.execute("SELECT COUNT(*) AS n FROM whale_insider_alerts WHERE kind = 'insider';").fetchone()
+        last_ts = self.execute("SELECT value FROM whale_insider_daemon_state WHERE key = 'last_ts';").fetchone()
+        return {
+            "whale_count": int(whale["n"]) if whale else 0,
+            "insider_count": int(insider["n"]) if insider else 0,
+            "last_indexed_ts": int(last_ts["value"]) if last_ts else 0,
+        }
+
     def create_copy_hook(
         self, follower_user_id: int, leader_user_id: int, config: dict | None = None
     ) -> int:
@@ -761,6 +1002,28 @@ class DatabaseManager:
                 (follower_user_id, leader_user_id),
             )
             return cur.rowcount > 0
+
+    def get_hooks_for_leader(self, leader_user_id: int) -> list[dict]:
+        """Get all copy-trading hooks that follow this leader (enabled only)."""
+        import json
+
+        rows = self.execute(
+            """
+            SELECT id, follower_user_id, leader_user_id, config, enabled, created_at
+            FROM copy_trading_hooks
+            WHERE leader_user_id = ? AND enabled = 1;
+            """,
+            (leader_user_id,),
+        ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["config"] = json.loads(d["config"] or "{}")
+            except Exception:
+                d["config"] = {}
+            out.append(d)
+        return out
 
     def add_global_copy_hook(
         self, follower_user_id: int, leader_address: str, config: dict | None = None
