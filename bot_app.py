@@ -27,6 +27,17 @@ import llm
 from database_manager import DatabaseManager
 from trading import execute_trade_for_user
 
+# AutoTrader manager for signal trading (from scripts/autotrader.py)
+try:
+    from autotrader_manager import (
+        AutoTraderManager,
+        TIMEFRAME_TO_SERIES,
+        DEFAULT_TRADE_AMOUNT_USD,
+    )
+    AUTOTRADER_AVAILABLE = True
+except ImportError:
+    AUTOTRADER_AVAILABLE = False
+
 # Real-time copy trading tracker
 try:
     from copy_trading import get_manager
@@ -1984,7 +1995,7 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 _pending_signal_amount_input[int(db_user["user_id"])] = True
                 await _safe_edit_message(
                     query,
-                    "Send the amount in USD you want to use per 5m signal (example: `10`).",
+                    "Send the number of shares you want to use per signal (example: `10`).",
                     parse_mode="Markdown",
                 )
                 return
@@ -2491,15 +2502,17 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
 
     async def _render_signal_trading_menu(chat_id: int, bot: Bot, db_user: dict, query=None) -> None:
         enabled = bool(db_user.get("signal_trading_enabled") or 0)
-        amt = float(db_user.get("signal_trade_amount_usd") or 0.0)
+        shares = int(db_user.get("signal_trade_amount_usd") or 5)
         status = "ON" if enabled else "OFF"
+
         text = (
             "📡 *Signal trading*\n\n"
             "Auto-trade *5 minute* series signals using your smart wallet.\n\n"
             f"Status: *{status}*\n"
-            f"Amount per signal: *${amt:.2f}*\n\n"
+            f"Shares per signal: *{shares}*\n\n"
             "Choose an action below."
         )
+
         kb = InlineKeyboardMarkup(
             [
                 [
@@ -2509,12 +2522,12 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                     )
                 ],
                 [
-                    InlineKeyboardButton("$5", callback_data="signals:amt:5"),
-                    InlineKeyboardButton("$10", callback_data="signals:amt:10"),
-                    InlineKeyboardButton("$20", callback_data="signals:amt:20"),
+                    InlineKeyboardButton("5 shares", callback_data="signals:amt:5"),
+                    InlineKeyboardButton("10 shares", callback_data="signals:amt:10"),
+                    InlineKeyboardButton("20 shares", callback_data="signals:amt:20"),
                 ],
                 [
-                    InlineKeyboardButton("✍️ Custom amount", callback_data="signals:amt:custom"),
+                    InlineKeyboardButton("✍️ Custom shares", callback_data="signals:amt:custom"),
                 ],
                 [
                     InlineKeyboardButton("🏠 Main Menu", callback_data="home:main"),
@@ -3533,6 +3546,106 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         )
         await update.message.reply_text(result, parse_mode="Markdown")
 
+    async def autotrader_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Manual autotrader signal execution command.
+
+        Syntax:
+          /autotrader SIGNAL SIDE TIMEFRAME [AMOUNT]
+        Example:
+          /autotrader BTC YES 5m
+          /autotrader BTC NO 15m 10
+
+        Supported timeframes: 1m, 5m, 15m, 30m, 1h
+        """
+        if not AUTOTRADER_AVAILABLE:
+            await update.message.reply_text(
+                "❌ Autotrader is not available in this instance."
+            )
+            return
+
+        user = update.effective_user
+        db_user = db.get_user(user.id)
+        if not db_user:
+            await update.message.reply_text("Please run /start first.")
+            return
+
+        parts = (update.message.text or "").split()
+        if len(parts) < 4:
+            await update.message.reply_text(
+                "Usage:\n`/autotrader SIGNAL SIDE TIMEFRAME [AMOUNT]`\n\n"
+                "Examples:\n"
+                "`/autotrader BTC YES 5m`\n"
+                "`/autotrader BTC NO 15m 10`\n\n"
+                "Supported timeframes: *1m, 5m, 15m, 30m, 1h*",
+                parse_mode="Markdown",
+            )
+            return
+
+        _, signal_asset, side, timeframe, *amount_parts = parts
+        amount = float(amount_parts[0]) if amount_parts else None
+
+        # Validate side
+        side_upper = side.upper()
+        if side_upper not in ("YES", "NO"):
+            await update.message.reply_text(
+                "Side must be *YES* or *NO*.",
+                parse_mode="Markdown",
+            )
+            return
+
+        # Validate timeframe
+        timeframe_lower = timeframe.lower()
+        if timeframe_lower not in TIMEFRAME_TO_SERIES:
+            await update.message.reply_text(
+                f"Unsupported timeframe: *{timeframe}*\n\n"
+                f"Supported: *{', '.join(TIMEFRAME_TO_SERIES.keys())}*",
+                parse_mode="Markdown",
+            )
+            return
+
+        # Build signal dict
+        signal = {
+            "signal": side_upper,
+            "timeframe": timeframe_lower,
+            "signal_ts": int(time.time()),
+            "market_end_ts": int(time.time()) + 300,  # 5 minutes from now
+        }
+
+        await update.message.reply_text(
+            f"🔄 Executing autotrader signal:\n"
+            f"• Signal: *{signal_asset}*\n"
+            f"• Side: *{side_upper}*\n"
+            f"• Timeframe: *{timeframe_upper}*\n"
+            f"• Amount: *${amount if amount else 'default'}*\n\n"
+            "Processing...",
+            parse_mode="Markdown",
+        )
+
+        try:
+            trade_amount = amount or float(db_user.get("signal_trade_amount_usd") or 3.0)
+
+            manager = AutoTraderManager(
+                db=db,
+                user_id=int(db_user["user_id"]),
+                trade_amount_usd=trade_amount,
+            )
+
+            traded, result = manager.process_signal(signal)
+
+            if traded:
+                await update.message.reply_text(
+                    f"✅ *Trade Executed*\n\n{result}",
+                    parse_mode="Markdown",
+                )
+            else:
+                await update.message.reply_text(
+                    f"⚠️ *Signal Skipped*\n\n{result}",
+                    parse_mode="Markdown",
+                )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {e}")
+
     async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Answers any normal text message using the LLM and the user's wallet context."""
         user = update.effective_user
@@ -4228,6 +4341,7 @@ _Tap buttons below to trade or analyze._"""
     app.add_handler(CommandHandler("join", join_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("commands", help_cmd))
+    app.add_handler(CommandHandler("autotrader", autotrader_cmd))
 
     # Inline button callbacks: markets menu, portfolio menu, category, market selection, trade
     app.add_handler(CallbackQueryHandler(handle_markets_menu_callback, pattern=r"^markets:(trending|volume|closing|category|back)$"))

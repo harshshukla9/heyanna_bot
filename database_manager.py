@@ -324,21 +324,6 @@ class DatabaseManager:
             except sqlite3.OperationalError:
                 pass
 
-            # ── Signal trading (auto-trade from series signals) ──
-            # Opt-in flag + per-user amount. Default OFF.
-            try:
-                conn.execute(
-                    "ALTER TABLE users ADD COLUMN signal_trading_enabled INTEGER DEFAULT 0;"
-                )
-            except sqlite3.OperationalError:
-                pass
-            try:
-                conn.execute(
-                    "ALTER TABLE users ADD COLUMN signal_trade_amount_usd REAL DEFAULT 0;"
-                )
-            except sqlite3.OperationalError:
-                pass
-
             # Global trade feed table for social/copy trading.
             conn.execute(
                 """
@@ -358,55 +343,17 @@ class DatabaseManager:
                 """
             )
 
-            # One row per user per signal auto-trade.
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS signal_autotrade_jobs (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id     INTEGER NOT NULL,
-                    series_slug TEXT,
-                    series      TEXT,
-                    event_slug  TEXT,
-                    condition_id TEXT NOT NULL,
-                    timeframe   TEXT,
-                    signal      TEXT,
-                    signal_ts   INTEGER NOT NULL,
-                    end_ts      INTEGER NOT NULL,
-                    status      TEXT NOT NULL,
-                    order_id    TEXT,
-                    tx_hash     TEXT,
-                    error       TEXT,
-                    created_at  INTEGER NOT NULL,
-                    updated_at  INTEGER NOT NULL,
-                    UNIQUE(user_id, condition_id, signal_ts),
-                    FOREIGN KEY (user_id) REFERENCES users(user_id)
-                );
-                """
-            )
+            # Optional column for order_id if upgrading an existing DB.
+            # Signal trading user settings (for bot UI and multi-user mode)
             try:
                 conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_signal_autotrade_jobs_due ON signal_autotrade_jobs(end_ts, status);"
+                    "ALTER TABLE users ADD COLUMN signal_trading_enabled INTEGER DEFAULT 0;"
                 )
             except sqlite3.OperationalError:
                 pass
-
-            # Outbox for Telegram notifications (bot delivers and marks sent).
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS signal_notifications_outbox (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id     INTEGER NOT NULL,
-                    kind        TEXT NOT NULL,
-                    text        TEXT NOT NULL,
-                    created_at  INTEGER NOT NULL,
-                    sent_at     INTEGER,
-                    FOREIGN KEY (user_id) REFERENCES users(user_id)
-                );
-                """
-            )
             try:
                 conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_signal_notifications_outbox_unsent ON signal_notifications_outbox(sent_at, created_at);"
+                    "ALTER TABLE users ADD COLUMN signal_trade_amount_usd REAL DEFAULT 0;"
                 )
             except sqlite3.OperationalError:
                 pass

@@ -153,11 +153,15 @@ def execute_trade_for_user(
     copied_from_user_id: int | None = None,
     token_id: str | None = None,
     outcome_index: int | None = None,
+    max_slippage: float = 0.05,
 ) -> str:
     """
     Execute a trade for a user. side = outcome (e.g. Yes/No, NSH, Under).
     Use order_side=SELL to close a position. Resolves generic labels (Yes/Under) to
     market's actual outcome name (e.g. NSH) when token_id or outcome_index is provided (copy-trade).
+
+    Args:
+        max_slippage: Maximum allowed slippage as decimal (default 5%). Used when falling back from FOK to market order.
     """
     # Resolve market from cache, or fetch by condition_id from CLOB and add to cache
     market_cache.ensure_market_cached(condition_id)
@@ -254,8 +258,9 @@ def execute_trade_for_user(
         order_side_clean = "BUY"
 
     order_id = status = tx_hash = None
+    fok_failed = False
 
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             trade_client = _create_clob_client(private_key, use_safe, trading_addr)
 
@@ -265,8 +270,17 @@ def execute_trade_for_user(
                 side=order_side_clean,
             )
             signed_order = trade_client.create_market_order(order_args)
-            resp = trade_client.post_order(signed_order, orderType=OrderType.FOK)
+
+            # Try FOK first, fall back to FAK if FOK fails due to liquidity
+            order_type = OrderType.FOK if not fok_failed else OrderType.FAK
+
+            resp = trade_client.post_order(signed_order, orderType=order_type)
             order_id, status, tx_hash = _parse_order_response(resp)
+
+            # If using IOC and got partial/failed status, log warning but continue
+            if order_type == OrderType.IOC and status not in ("matched", "filled"):
+                logger.warning("IOC order returned status %s for user %s", status, user_id)
+
             break  # success
 
         except PolyApiException as e:
@@ -282,28 +296,61 @@ def execute_trade_for_user(
                     "trading_addr": trading_addr,
                     "use_safe": use_safe,
                     "condition_id": m.condition_id[:20] + "..." if m.condition_id else None,
+                    "order_type": "FOK" if not fok_failed else "IOC",
                 },
             )
-            if attempt == 0 and _is_allowance_error(e):
-                try:
-                    usdc_bal = get_usdc_e_balance_on_polygon(trading_addr)
-                    logger.warning(
-                        "Trade attempt 1 failed with allowance error for user %s; "
-                        "trading_addr=%s USDC.e_balance=%.4f; forcing gasless re-approval and retrying...",
-                        user_id, trading_addr, usdc_bal if usdc_bal is not None else 0.0,
-                    )
-                except Exception:
-                    logger.warning(
-                        "Trade attempt 1 failed with allowance error for user %s; "
-                        "trading_addr=%s; forcing gasless re-approval and retrying...",
-                        user_id, trading_addr,
-                    )
-                _force_reapprove(db, user_id, owner_addr)
-                time.sleep(5)  # allow approval tx to be mined before retry
-                continue
 
             err = getattr(e, "error_message", {}) or {}
             last_error = err.get("error") or str(e)
+
+            # Check if this is an allowance/balance error
+            if _is_allowance_error(e):
+                if attempt == 0:
+                    try:
+                        usdc_bal = get_usdc_e_balance_on_polygon(trading_addr)
+                        logger.warning(
+                            "Trade attempt 1 failed with allowance error for user %s; "
+                            "trading_addr=%s USDC.e_balance=%.4f; forcing gasless re-approval and retrying...",
+                            user_id, trading_addr, usdc_bal if usdc_bal is not None else 0.0,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Trade attempt 1 failed with allowance error for user %s; "
+                            "trading_addr=%s; forcing gasless re-approval and retrying...",
+                            user_id, trading_addr,
+                        )
+                    _force_reapprove(db, user_id, owner_addr)
+                    time.sleep(5)
+                    continue
+                else:
+                    # Allowance error after re-approval
+                    try:
+                        db.record_trade(
+                            user_id=user_id, market_id=m.market_id, side=side_clean,
+                            amount=amount_value, status="error", order_id=None,
+                            tx_hash="", executed_at=int(time.time()),
+                            copied_from_user_id=copied_from_user_id,
+                            condition_id=m.condition_id,
+                        )
+                    except Exception:
+                        pass
+                    return (
+                        "❌ TRADE FAILED: not enough balance or allowance on your trading wallet.\n"
+                        "Make sure you have USDC.e in your Safe trading wallet (see /balance)."
+                    )
+
+            # Check if this is a FOK liquidity error - fallback to FAK (partial fills allowed)
+            if "FOK" in str(last_error) or "couldn't be fully filled" in str(last_error).lower():
+                if not fok_failed:
+                    logger.info(
+                        "FOK order failed due to liquidity for user %s; "
+                        "retrying with FAK (partial fills allowed)...",
+                        user_id,
+                    )
+                    fok_failed = True
+                    continue
+
+            # Other error - log and fail
             logger.error("Trade execution failed: %s", last_error)
             try:
                 db.record_trade(
@@ -315,10 +362,7 @@ def execute_trade_for_user(
                 )
             except Exception:
                 pass
-            return (
-                "❌ TRADE FAILED: not enough balance or allowance on your trading wallet.\n"
-                "Make sure you have USDC.e in your Safe trading wallet (see /balance)."
-            )
+            return f"❌ TRADE FAILED: {last_error}"
 
         except Exception as e:
             logger.error("Trade execution failed: %s", e)
@@ -335,7 +379,7 @@ def execute_trade_for_user(
             return f"❌ TRADE FAILED: {e}"
     else:
         return (
-            "❌ TRADE FAILED after automatic re-approval.\n"
+            "❌ TRADE FAILED after automatic retries.\n"
             "Ensure you have USDC.e in your Safe wallet and try again."
         )
 
@@ -448,84 +492,66 @@ def execute_limit_order_for_user(
 
     order_id = status = tx_hash = None
 
-    for attempt in range(2):
+    # Single attempt - no retry to prevent duplicate orders
+    try:
+        trade_client = _create_clob_client(private_key, use_safe, trading_addr)
+
+        # Step 1: Create and sign locally with options (tick_size, neg_risk)
         try:
-            trade_client = _create_clob_client(private_key, use_safe, trading_addr)
-
-            # Step 1: Create and sign locally with options (tick_size, neg_risk)
-            try:
-                tick_size = trade_client.get_tick_size(token_id)
-            except Exception:
-                tick_size = "0.01"
-            try:
-                neg_risk = trade_client.get_neg_risk(token_id)
-            except Exception:
-                neg_risk = False
-            options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
-            side_const = BUY if order_side_clean == "BUY" else SELL
-            order_args = OrderArgs(
-                token_id=token_id,
-                price=price_val,
-                size=size_val,
-                side=side_const,
-            )
-            signed_order = trade_client.create_order(order_args, options=options)
-
-            # Step 2: Submit to the CLOB
-            resp = trade_client.post_order(signed_order, orderType=OrderType.GTC)
-            order_id, status, tx_hash = _parse_order_response(resp)
-            break
-
-        except PolyApiException as e:
-            _log_clob_error(
-                e,
-                "post_order (limit)",
-                user_id=user_id,
-                request_ctx={
-                    "token_id": token_id,
-                    "price": price_val,
-                    "size": size_val,
-                    "side": side_clean,
-                    "order_side": order_side_clean,
-                    "trading_addr": trading_addr,
-                    "use_safe": use_safe,
-                    "condition_id": m.condition_id[:20] + "..." if m.condition_id else None,
-                },
-            )
-            if attempt == 0 and _is_allowance_error(e):
-                try:
-                    usdc_bal = get_usdc_e_balance_on_polygon(trading_addr)
-                    logger.warning(
-                        "Limit order attempt 1 failed with allowance error for user %s; "
-                        "trading_addr=%s USDC.e_balance=%.4f; forcing gasless re-approval and retrying...",
-                        user_id, trading_addr, usdc_bal if usdc_bal is not None else 0.0,
-                    )
-                except Exception:
-                    logger.warning(
-                        "Limit order attempt 1 failed with allowance error for user %s; "
-                        "trading_addr=%s; forcing gasless re-approval and retrying...",
-                        user_id, trading_addr,
-                    )
-                _force_reapprove(db, user_id, owner_addr)
-                time.sleep(5)  # allow approval tx to be mined before retry
-                continue
-
-            err = getattr(e, "error_message", {}) or {}
-            msg = err.get("error") or str(e)
-            logger.error("Limit order failed: %s", msg)
-            return (
-                "❌ LIMIT ORDER FAILED: not enough balance or allowance on your trading wallet.\n"
-                "Make sure you have USDC.e in your Safe (see /balance)."
-            )
-
-        except Exception as e:
-            logger.error("Limit order execution failed: %s", e)
-            return f"❌ LIMIT ORDER FAILED: {e}"
-    else:
-        return (
-            "❌ LIMIT ORDER FAILED after automatic re-approval.\n"
-            "Ensure you have USDC.e in your Safe wallet and try again."
+            tick_size = trade_client.get_tick_size(token_id)
+        except Exception:
+            tick_size = "0.01"
+        try:
+            neg_risk = trade_client.get_neg_risk(token_id)
+        except Exception:
+            neg_risk = False
+        options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
+        side_const = BUY if order_side_clean == "BUY" else SELL
+        order_args = OrderArgs(
+            token_id=token_id,
+            price=price_val,
+            size=size_val,
+            side=side_const,
         )
+        signed_order = trade_client.create_order(order_args, options=options)
+
+        # Step 2: Submit to the CLOB
+        resp = trade_client.post_order(signed_order, orderType=OrderType.GTC)
+        order_id, status, tx_hash = _parse_order_response(resp)
+
+        # Log successful order creation
+        logger.info(
+            "Limit order created: user=%s condition_id=%s side=%s price=%.4f size=%.4f order_id=%s status=%s",
+            user_id, m.condition_id[:20] if m.condition_id else None, side_clean, price_val, size_val, order_id, status
+        )
+
+    except PolyApiException as e:
+        _log_clob_error(
+            e,
+            "post_order (limit)",
+            user_id=user_id,
+            request_ctx={
+                "token_id": token_id,
+                "price": price_val,
+                "size": size_val,
+                "side": side_clean,
+                "order_side": order_side_clean,
+                "trading_addr": trading_addr,
+                "use_safe": use_safe,
+                "condition_id": m.condition_id[:20] + "..." if m.condition_id else None,
+            },
+        )
+        err = getattr(e, "error_message", {}) or {}
+        msg = err.get("error") or str(e)
+        logger.error("Limit order failed: %s", msg)
+        return (
+            "❌ LIMIT ORDER FAILED: not enough balance or allowance on your trading wallet.\n"
+            "Make sure you have USDC.e in your Safe (see /balance)."
+        )
+
+    except Exception as e:
+        logger.error("Limit order execution failed: %s", e)
+        return f"❌ LIMIT ORDER FAILED: {e}"
 
     return (
         "✅ LIMIT ORDER PLACED\n"

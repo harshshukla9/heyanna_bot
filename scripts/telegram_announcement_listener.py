@@ -312,6 +312,7 @@ def parse_signal_from_text(text: str) -> dict[str, Any] | None:
 async def run_listener(
     cfg: ListenerConfig,
     on_signal: Callable[[dict[str, Any]], None] | None = None,
+    on_trade: Callable[[dict[str, Any], str], str] | None = None,
 ) -> None:
     seen_keys = _load_seen_message_keys(cfg.output_path)
     print(f"[listener] loaded {len(seen_keys)} existing message keys from {cfg.output_path}")
@@ -466,6 +467,24 @@ async def run_listener(
                 on_signal(payload)
             except Exception:
                 pass
+
+        # Execute trade if on_trade callback provided and this is a live signal
+        if on_trade and source.startswith("live:"):
+            try:
+                trade_result = on_trade(payload)
+                if trade_result:
+                    payload["trade_result"] = trade_result
+                    # Re-append with trade result
+                    _append_jsonl(cfg.output_path, {
+                        "source": "trade",
+                        "message_key": key,
+                        "trade_result": trade_result,
+                        "logged_at": int(time.time()),
+                    })
+                    print(f"[listener] trade result: {trade_result[:100]}...")
+            except Exception as e:
+                print(f"[listener] trade execution failed: {e}", file=sys.stderr)
+
         seen_keys.add(key)
         out = {**parsed, "signal_ts": signal_ts, "signal_at": signal_at, "market_end_ts": market_end_ts, "market_end_at": market_end_at}
         print(f"[listener] {source} signal: {json.dumps(out, ensure_ascii=False)}")

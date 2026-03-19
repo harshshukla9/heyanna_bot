@@ -26,6 +26,20 @@ from openpyxl import Workbook
 
 from database_manager import DatabaseManager
 
+# Import autotrader manager for signal trading integration
+try:
+    from autotrader_manager import (
+        AutoTraderManager,
+        TIMEFRAME_TO_SERIES,
+        execute_signal_trade_for_user,
+        DEFAULT_TRADE_AMOUNT_USD,
+        MAX_SIGNAL_AGE_SECONDS,
+    )
+    from scripts.series_5m_order_app import _resolve_latest_event_for_series_slug
+    AUTOTRADER_AVAILABLE = True
+except ImportError:
+    AUTOTRADER_AVAILABLE = False
+
 
 # ── Admin Bearer Token ────────────────────────────────────────────────────
 ADMIN_BEARER_TOKEN = "sagar_dont_sleep"
@@ -1265,6 +1279,12 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
     """
     app = FastAPI(title="Polymarket Hybrid Trading API")
 
+    # ── AutoTrader settings (from scripts/autotrader.py) ───────────────────
+    # Use limit orders to avoid liquidity/slippage issues
+    USE_LIMIT_ORDERS = True
+    LIMIT_ORDER_PRICE = 0.55  # Max price per share (55 cents)
+    MIN_ORDER_SHARES = 5  # Polymarket minimum order size
+
     # CORS: allow frontend at beta.heyanna.trade to call the API directly.
     app.add_middleware(
         CORSMiddleware,
@@ -1374,84 +1394,42 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
 
     @app.on_event("startup")
     async def _start_background_tasks():
-        # In-memory guard so concurrent strategies do not auto-trade multiple times
-        # for the same Polymarket series within its time window (e.g. 5m).
-        _signal_last_autotrade_ts: dict[str, int] = {}
-
-        def _signal_window_seconds(timeframe: str) -> int:
-            tf = (timeframe or "").strip().lower()
-            if tf.endswith("m"):
-                try:
-                    mins = int(tf[:-1])
-                    return max(0, mins) * 60
-                except Exception:
-                    return 0
-            return 0
-
-        def _signal_scope_key(payload: dict) -> str:
-            series_slug = (payload.get("series_slug") or "").strip()
-            series = (payload.get("series") or "").strip()
-            asset = (payload.get("asset") or "").strip()
-            tf = (payload.get("timeframe") or "").strip()
-            scope = (series_slug or series or asset or "market").strip().lower()
-            return f"{scope}:{tf.strip().lower()}"
-
         async def _enqueue_outbox(user_id: int, kind: str, text: str) -> None:
-            now_ts = int(time.time())
-            try:
-                db.execute(
-                    """
-                    INSERT INTO signal_notifications_outbox (user_id, kind, text, created_at, sent_at)
-                    VALUES (?, ?, ?, ?, NULL);
-                    """,
-                    (int(user_id), str(kind), str(text), now_ts),
-                )
-            except Exception:
-                pass
+            # Notifications sent via bot, no outbox table needed
+            pass
 
         async def _handle_autotrade_signal(payload: dict) -> None:
             """
-            Execute signal auto-trades for opted-in users.
-            Triggered by the in-process Telegram listener callback.
+            Execute signal auto-trades using autotrader.py logic.
+            Instant execution - trades immediately when signal is received.
+            Multi-user support: trades for all enabled users.
             """
             try:
                 if not isinstance(payload, dict):
                     return
                 if not payload.get("parsed"):
                     return
-                if str(payload.get("source") or "") != "live:new":
-                    return
+
+                # Get timeframe - support all timeframes
                 timeframe = (payload.get("timeframe") or "").strip().lower()
-                if timeframe != "5m":
+                if not timeframe or timeframe not in TIMEFRAME_TO_SERIES:
                     return
 
-                condition_id = (payload.get("condition_id") or "").strip()
-                end_ts = int(payload.get("end_ts") or 0)
                 side = (payload.get("signal") or "").strip().upper()
-                if not condition_id or end_ts <= 0 or side not in ("YES", "NO"):
+                if side not in ("YES", "NO"):
                     return
 
-                # Concurrency window: first signal wins for series+timeframe.
-                window = _signal_window_seconds(timeframe)
-                key = _signal_scope_key(payload)
                 now_ts = int(time.time())
-                last_ts = int(_signal_last_autotrade_ts.get(key) or 0)
-                signal_ts = int(payload.get("signal_ts") or 0) or now_ts
-                if window and last_ts and signal_ts < (last_ts + window):
-                    return
-                _signal_last_autotrade_ts[key] = signal_ts
 
+                # Get all enabled users with trade amount
                 rows = db.execute(
-                    """
-                    SELECT user_id, eth_address, signal_trade_amount_usd
-                    FROM users
-                    WHERE signal_trading_enabled = 1 AND COALESCE(signal_trade_amount_usd, 0) > 0;
-                    """
+                    "SELECT user_id, signal_trade_amount_usd FROM users WHERE signal_trading_enabled = 1 AND COALESCE(signal_trade_amount_usd, 0) > 0;"
                 ).fetchall()
+
                 if not rows:
                     return
 
-                # Execute per user; isolate failures.
+                # Execute trade for each enabled user
                 for r in rows:
                     try:
                         uid = int(r["user_id"])
@@ -1459,192 +1437,31 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                         if amount_usd <= 0:
                             continue
 
-                        created_at = int(time.time())
-                        # Create job (idempotent by UNIQUE constraint).
-                        try:
-                            db.execute(
-                                """
-                                INSERT INTO signal_autotrade_jobs (
-                                    user_id, series_slug, series, event_slug, condition_id, timeframe,
-                                    signal, signal_ts, end_ts, status, order_id, tx_hash, error,
-                                    created_at, updated_at
-                                )
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?);
-                                """,
-                                (
-                                    uid,
-                                    (payload.get("series_slug") or None),
-                                    (payload.get("series") or None),
-                                    (payload.get("event_slug") or None),
-                                    condition_id,
-                                    timeframe,
-                                    side,
-                                    signal_ts,
-                                    end_ts,
-                                    "queued",
-                                    created_at,
-                                    created_at,
-                                ),
-                            )
-                        except Exception:
-                            # Already exists (or schema mismatch); do not duplicate.
-                            pass
+                        # Use autotrader_manager for instant execution
+                        signal_dict = {
+                            "signal": side,
+                            "timeframe": timeframe,
+                            "signal_ts": now_ts,
+                            "market_end_ts": now_ts + 300,
+                        }
 
-                        # Execute immediately (time critical) using existing safe-aware trading logic.
-                        result_text = await asyncio.to_thread(
-                            execute_trade_for_user,
-                            db,
-                            uid,
-                            side,
-                            amount_usd,
-                            condition_id,
+                        manager = AutoTraderManager(
+                            db=db,
+                            user_id=uid,
+                            trade_amount_usd=amount_usd,
+                            dry_run=False,
+                            use_limit_orders=USE_LIMIT_ORDERS,
+                            limit_order_price=LIMIT_ORDER_PRICE,
                         )
-                        parsed = _parse_trade_result(result_text or "")
-                        ok = bool(parsed.get("success"))
-                        order_id = parsed.get("order_id")
-                        tx_hash = parsed.get("tx_hash")
 
-                        status = "traded" if ok else "failed"
-                        err = None if ok else (parsed.get("raw") or "trade failed")
-                        try:
-                            db.execute(
-                                """
-                                UPDATE signal_autotrade_jobs
-                                SET status = ?, order_id = ?, tx_hash = ?, error = ?, updated_at = ?
-                                WHERE user_id = ? AND condition_id = ? AND signal_ts = ?;
-                                """,
-                                (
-                                    status,
-                                    order_id,
-                                    tx_hash,
-                                    err,
-                                    int(time.time()),
-                                    uid,
-                                    condition_id,
-                                    signal_ts,
-                                ),
-                            )
-                        except Exception:
-                            pass
+                        traded, result = manager.process_signal(signal_dict)
 
-                        # Outbox notification for user.
-                        series_title = (payload.get("series") or payload.get("series_slug") or "signal market")
-                        if ok:
-                            await _enqueue_outbox(
-                                uid,
-                                "signal_trade_placed",
-                                f"Auto-trade placed ({timeframe.upper()}): {side} on {series_title}",
-                            )
-                        else:
-                            await _enqueue_outbox(
-                                uid,
-                                "signal_trade_failed",
-                                f"Auto-trade failed ({timeframe.upper()}): {side} on {series_title}",
-                            )
+                        # Trade executed via autotrader_manager
                     except Exception:
                         continue
             except Exception:
                 return
 
-        async def _signal_resolution_scheduler_loop() -> None:
-            """
-            After end_ts (+grace), classify win/loss and auto-claim for signal trades.
-            """
-            grace_sec = max(30, int(float(os.getenv("SIGNAL_RESOLUTION_GRACE_SEC", "60") or "60")))
-            interval = max(5.0, float(os.getenv("SIGNAL_RESOLUTION_INTERVAL_SEC", "10") or "10"))
-
-            def _fetch_closed_positions_for_user_wallet(wallet: str) -> list[dict]:
-                try:
-                    url = f"https://data-api.polymarket.com/closed-positions?user={wallet}&limit=50"
-                    resp = requests.get(url, timeout=10)
-                    data = resp.json() if resp.status_code == 200 else []
-                    return data if isinstance(data, list) else []
-                except Exception:
-                    return []
-
-            from bot_tools import get_trading_wallet_address as _get_trading_wallet
-            import bot_tools as _bot_tools
-
-            while True:
-                try:
-                    now_ts = int(time.time())
-                    rows = db.execute(
-                        """
-                        SELECT j.id, j.user_id, j.condition_id, j.end_ts, j.timeframe, j.signal, j.series, j.series_slug, u.eth_address
-                        FROM signal_autotrade_jobs j
-                        LEFT JOIN users u ON u.user_id = j.user_id
-                        WHERE j.status IN ('traded', 'queued') AND j.end_ts <= ?
-                        ORDER BY j.end_ts ASC
-                        LIMIT 50;
-                        """,
-                        (now_ts - grace_sec,),
-                    ).fetchall()
-                    if not rows:
-                        await asyncio.sleep(interval)
-                        continue
-
-                    for r in rows:
-                        try:
-                            jid = int(r["id"])
-                            uid = int(r["user_id"])
-                            cid = (r["condition_id"] or "").strip()
-                            eth_address = (r["eth_address"] or "").strip()
-                            if not cid or not eth_address:
-                                db.execute(
-                                    "UPDATE signal_autotrade_jobs SET status = ?, updated_at = ? WHERE id = ?;",
-                                    ("failed", int(time.time()), jid),
-                                )
-                                continue
-
-                            trading_wallet = _get_trading_wallet(eth_address) or eth_address
-                            closed = await asyncio.to_thread(_fetch_closed_positions_for_user_wallet, trading_wallet)
-                            pos = next(
-                                (
-                                    p for p in closed
-                                    if str(p.get("conditionId") or p.get("condition_id") or "").strip().lower() == cid.lower()
-                                ),
-                                None,
-                            )
-                            # If not yet in closed positions, skip until next tick.
-                            if not pos:
-                                continue
-
-                            pnl = None
-                            for k in ("cashPnl", "cash_pnl", "pnl", "realizedPnl", "realized_pnl"):
-                                if k in pos:
-                                    try:
-                                        pnl = float(pos.get(k) or 0.0)
-                                        break
-                                    except Exception:
-                                        pnl = None
-                            win = pnl is not None and pnl > 0
-                            series_title = (r["series"] or r["series_slug"] or "signal market")
-                            tf = (r["timeframe"] or "").strip().upper() or "5M"
-
-                            await _enqueue_outbox(
-                                uid,
-                                "signal_resolved_win" if win else "signal_resolved_loss",
-                                f"Signal resolved ({tf}) on {series_title}: {'WIN' if win else 'LOSS'}",
-                            )
-
-                            # Auto-claim winnings (gasless); safe to call even if none.
-                            claim_res = await asyncio.to_thread(_bot_tools.claim_polymarket_winnings, eth_address)
-                            await _enqueue_outbox(
-                                uid,
-                                "signal_claimed",
-                                f"Auto-claim: {strip_emoji(str(claim_res or 'done'))}",
-                            )
-
-                            db.execute(
-                                "UPDATE signal_autotrade_jobs SET status = ?, updated_at = ? WHERE id = ?;",
-                                ("claimed", int(time.time()), jid),
-                            )
-                        except Exception:
-                            continue
-
-                except Exception as e:
-                    logging.getLogger(__name__).warning("[SIGNAL RESOLUTION] loop error: %s", e)
-                await asyncio.sleep(interval)
         # Initialize copy trading schema
         if COPY_TRACKER_AVAILABLE:
             try:
@@ -1706,12 +1523,6 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                     )
             asyncio.create_task(_telegram_signal_listener_loop())
 
-        # Scheduler for signal resolution, win/loss, and auto-claim.
-        try:
-            asyncio.create_task(_signal_resolution_scheduler_loop())
-        except Exception as e:
-            logging.getLogger(__name__).warning("[SIGNAL RESOLUTION] Failed to start loop: %s", e)
-
         # Whale / insider indexer: scan Polymarket global trades and flag large bets (whale >= 100k, insider new account >= 55k).
         if os.getenv("DISABLE_WHALE_INSIDER_DAEMON", "").strip().lower() not in ("1", "true", "yes"):
             async def _whale_insider_indexer_loop() -> None:
@@ -1732,6 +1543,51 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
     @app.get("/health", tags=["system"], summary="Health check")
     async def health():
         return {"status": "ok"}
+
+    @app.get(
+        "/autotrader/markets",
+        tags=["autotrader"],
+        summary="List all available autotrader markets for all timeframes",
+    )
+    async def autotrader_markets():
+        """
+        Return all available markets for all supported timeframes.
+        Uses the same resolution logic as the autotrader script.
+        """
+        if not AUTOTRADER_AVAILABLE:
+            raise HTTPException(status_code=503, detail="AutoTrader module not available")
+
+        try:
+            results = {}
+            for timeframe, series_slug in TIMEFRAME_TO_SERIES.items():
+                try:
+                    resolved = _resolve_latest_event_for_series_slug(
+                        series_slug,
+                        max_events=2000,
+                        page_size=200,
+                        active_only=False,
+                    )
+                    results[timeframe] = {
+                        "series_slug": series_slug,
+                        "condition_id": resolved.condition_id,
+                        "event_slug": resolved.event_slug,
+                        "success": True,
+                    }
+                except Exception as e:
+                    results[timeframe] = {
+                        "series_slug": series_slug,
+                        "success": False,
+                        "error": str(e),
+                    }
+
+            return {
+                "success": True,
+                "timeframes": results,
+                "count": len(TIMEFRAME_TO_SERIES),
+            }
+        except Exception as e:
+            logger.error(f"[autotrader] Markets lookup failed: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
     @app.get(
         "/indexer/whale-insider",
@@ -2819,32 +2675,6 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
             "amount_usd": float(user2.get("signal_trade_amount_usd") or 0.0),
         }
 
-    @app.get(
-        "/me/signal-trading/jobs",
-        tags=["signal-trading"],
-        summary="List recent signal auto-trade jobs for current user",
-    )
-    async def list_signal_trading_jobs(
-        limit: int = Query(50, ge=1, le=200),
-        current=Depends(_get_current_session),
-    ):
-        user = db.get_user(current["user_id"])
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found.")
-        rows = db.execute(
-            """
-            SELECT
-                id, series_slug, series, event_slug, condition_id, timeframe, signal,
-                signal_ts, end_ts, status, order_id, tx_hash, error, created_at, updated_at
-            FROM signal_autotrade_jobs
-            WHERE user_id = ?
-            ORDER BY signal_ts DESC
-            LIMIT ?;
-            """,
-            (user["user_id"], limit),
-        ).fetchall()
-        return {"jobs": [dict(r) for r in rows], "count": len(rows)}
-
     @app.post(
         "/me/signal-trading/claim-latest",
         tags=["signal-trading"],
@@ -2861,6 +2691,88 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
 
         result_text = await asyncio.to_thread(_bot_tools.claim_polymarket_winnings, address)
         return {"wallet": address, "result": strip_emoji(str(result_text or ""))}
+
+    @app.post(
+        "/me/signal-trading/test",
+        tags=["signal-trading"],
+        summary="Test signal trading by executing a trade immediately",
+    )
+    async def test_signal_trade(
+        body: dict,
+        current=Depends(_get_current_session_for_trading),
+    ):
+        """
+        Test signal trading using autotrader.py logic.
+        Execute a trade immediately without waiting for Telegram signals.
+
+        Body:
+        - timeframe: 1m, 5m, 15m, 30m, 1h
+        - side: YES or NO
+        - amount_usd: optional (uses user's signal_trade_amount_usd)
+        - dry_run: optional (default False)
+        """
+        if not AUTOTRADER_AVAILABLE:
+            raise HTTPException(status_code=503, detail="AutoTrader module not available")
+
+        user = db.get_user(current["user_id"])
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found.")
+
+        timeframe = (body.get("timeframe") or "5m").strip().lower()
+        side = (body.get("side") or "YES").strip().upper()
+        amount_usd = body.get("amount_usd") or float(user.get("signal_trade_amount_usd") or 3.0)
+        dry_run = body.get("dry_run", False)
+
+        if timeframe not in TIMEFRAME_TO_SERIES:
+            raise HTTPException(status_code=400, detail=f"Invalid timeframe. Use: {', '.join(TIMEFRAME_TO_SERIES.keys())}")
+        if side not in ("YES", "NO"):
+            raise HTTPException(status_code=400, detail="side must be YES or NO")
+
+        signal = {
+            "signal": side,
+            "timeframe": timeframe,
+            "signal_ts": int(time.time()),
+            "market_end_ts": int(time.time()) + TIMEFRAME_TO_SERIES.get(timeframe, 300),
+        }
+
+        manager = AutoTraderManager(
+            db=db,
+            user_id=int(user["user_id"]),
+            trade_amount_usd=float(amount_usd),
+            dry_run=bool(dry_run),
+            use_limit_orders=USE_LIMIT_ORDERS,
+            limit_order_price=LIMIT_ORDER_PRICE,
+        )
+
+        traded, result = manager.process_signal(signal)
+
+        return {
+            "success": True,
+            "traded": traded,
+            "result": result,
+            "dry_run": bool(dry_run),
+            "timeframe": timeframe,
+            "side": side,
+            "amount_usd": float(amount_usd),
+        }
+
+    @app.get(
+        "/autotrader/timeframes",
+        tags=["autotrader"],
+        summary="Get supported timeframes and their series slugs",
+    )
+    async def autotrader_timeframes():
+        """
+        Return the mapping of timeframes to Polymarket series slugs.
+        Useful for clients to know which timeframes are supported.
+        """
+        if not AUTOTRADER_AVAILABLE:
+            raise HTTPException(status_code=503, detail="AutoTrader module not available")
+
+        return {
+            "timeframes": TIMEFRAME_TO_SERIES,
+            "count": len(TIMEFRAME_TO_SERIES),
+        }
 
     class FollowRequest(BaseModel):
         """Request body for following a copy trading leader."""
