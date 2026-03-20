@@ -357,6 +357,31 @@ class DatabaseManager:
                 )
             except sqlite3.OperationalError:
                 pass
+            # Separate settings for 5m and 15m signal trading
+            try:
+                conn.execute(
+                    "ALTER TABLE users ADD COLUMN signal_5m_enabled INTEGER DEFAULT 0;"
+                )
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute(
+                    "ALTER TABLE users ADD COLUMN signal_5m_amount_usd REAL DEFAULT 0;"
+                )
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute(
+                    "ALTER TABLE users ADD COLUMN signal_15m_enabled INTEGER DEFAULT 0;"
+                )
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute(
+                    "ALTER TABLE users ADD COLUMN signal_15m_amount_usd REAL DEFAULT 0;"
+                )
+            except sqlite3.OperationalError:
+                pass
 
             # Optional column for order_id if upgrading an existing DB.
             try:
@@ -544,6 +569,11 @@ class DatabaseManager:
                 );
                 """
             )
+            # Add side column if missing
+            try:
+                conn.execute("ALTER TABLE whale_insider_alerts ADD COLUMN side TEXT;")
+            except sqlite3.OperationalError:
+                pass
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS whale_insider_seen_wallets (
@@ -815,12 +845,14 @@ class DatabaseManager:
         condition_id: str | None = None,
         market_title: str | None = None,
         tx_hash: str | None = None,
+        side: str | None = None,
     ) -> bool:
         """Insert a whale or insider alert (indexed flag). kind must be 'whale' or 'insider'. Returns True if inserted."""
         wallet = (wallet or "").strip()
         if not wallet or kind not in ("whale", "insider"):
             return False
         tx_hash = (tx_hash or "").strip() or ""
+        side = (side or "").strip() or None
         with self.transaction() as conn:
             if tx_hash:
                 existing = conn.execute(
@@ -829,20 +861,29 @@ class DatabaseManager:
                 ).fetchone()
                 if existing:
                     return False
-            conn.execute(
-                """
-                INSERT INTO whale_insider_alerts (wallet, kind, trade_usd, condition_id, market_title, tx_hash, executed_at, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'));
-                """,
-                (wallet, kind, trade_usd, condition_id or "", (market_title or "")[:255], tx_hash, executed_at),
-            )
+            if side:
+                conn.execute(
+                    """
+                    INSERT INTO whale_insider_alerts (wallet, kind, trade_usd, condition_id, market_title, tx_hash, executed_at, created_at, side)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'), ?);
+                    """,
+                    (wallet, kind, trade_usd, condition_id or "", (market_title or "")[:255], tx_hash, executed_at, side),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO whale_insider_alerts (wallet, kind, trade_usd, condition_id, market_title, tx_hash, executed_at, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'));
+                    """,
+                    (wallet, kind, trade_usd, condition_id or "", (market_title or "")[:255], tx_hash, executed_at),
+                )
             return True
 
     def get_recent_whale_insider_alerts(self, limit: int = 50) -> list[dict]:
         """Return recent whale/insider alerts for notifications, newest first."""
         rows = self.execute(
             """
-            SELECT wallet, kind, trade_usd, condition_id, market_title, tx_hash, executed_at, created_at
+            SELECT wallet, kind, trade_usd, condition_id, market_title, tx_hash, executed_at, created_at, side
             FROM whale_insider_alerts
             ORDER BY executed_at DESC
             LIMIT ?;

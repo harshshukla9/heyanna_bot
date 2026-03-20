@@ -149,7 +149,8 @@ def _load_config_from_env() -> ListenerConfig:
         history_days = int(history_days_raw)
     except ValueError:
         history_days = 7
-    history_days = max(1, history_days)
+    # Allow 0 to skip historical backfill and go straight to live mode.
+    history_days = max(0, history_days)
 
     try:
         history_limit = int(history_limit_raw)
@@ -204,42 +205,51 @@ def parse_signal_from_text(text: str) -> dict[str, Any] | None:
     Lightweight parser for announcement-style short-horizon market calls.
     Output is geared for Polymarket: signal "YES" = Buy YES (bullish/UP),
     signal "NO" = Buy NO (bearish/DOWN). Parse-only, no trade execution.
+
+    Matches formats like:
+    - "⚡ METAZEN SIGNAL — 5M"
+    - "⚡ METAZEN SIGNAL — 15M"
     """
     src = (text or "").strip()
     if not src:
         return None
     low = src.lower()
 
-    # Only parse messages that are signal announcements (e.g. "METAZEN SIGNAL — 5M").
-    if "signal" not in low or "—" not in src:
+    # Get first line for header validation
+    first_line = src.split('\n')[0].strip()
+
+    # Strict pattern: must be exactly "⚡ METAZEN SIGNAL — 5M" or "⚡ METAZEN SIGNAL — 15M"
+    # Only these two timeframe formats are valid signals
+    valid_header_pattern = r"^\s*(⚡\s*)?METAZEN\s+SIGNAL\s+—\s*(5M|15M)\s*$"
+    if not re.search(valid_header_pattern, first_line, re.IGNORECASE):
         return None
-    # Skip outcome reports (❌ LOSS — / ✅ WIN —), not entry signals.
-    if re.search(r"LOSS\s*—|WIN\s*—", src):
+
+    # Validate Direction field exists with proper format: "Direction: 🟢 ▲ UP" or "Direction: 🔴 ▼ DOWN"
+    # This is the key indicator that this is a real METAZEN signal
+    direction_up_pattern = r"Direction:\s*🟢\s*▲\s*UP"
+    direction_down_pattern = r"Direction:\s*🔴\s*▼\s*DOWN"
+    if not re.search(direction_up_pattern, src) and not re.search(direction_down_pattern, src):
+        return None
+
+    # Validate required fields: Direction + Strategy are required
+    # RSI and Time are optional (some signals may be abbreviated format)
+    has_strategy = re.search(r"Strategy\s*:", src) is not None
+
+    if not has_strategy:
         return None
 
     # These are Bitcoin signals; "METAZEN" in the header is the channel brand, not the asset.
     asset = "BTC"
 
-    timeframe = None
-    if re.search(r"\b(1m|1\s*min(?:ute)?s?)\b", low):
-        timeframe = "1m"
-    elif re.search(r"\b(5m|5\s*min(?:ute)?s?)\b", low):
-        timeframe = "5m"
-    elif re.search(r"\b(15m|15\s*min(?:ute)?s?)\b", low):
-        timeframe = "15m"
-    elif re.search(r"\b(30m|30\s*min(?:ute)?s?)\b", low):
-        timeframe = "30m"
-    elif re.search(r"\b(1h|60\s*min(?:ute)?s?)\b", low):
-        timeframe = "1h"
+    # Extract timeframe from the validated header (only 5m or 15m are valid)
+    timeframe_match = re.search(r"^\s*(⚡\s*)?METAZEN\s+SIGNAL\s+—\s*(5M|15M)\s*", first_line, re.IGNORECASE)
+    timeframe = timeframe_match.group(2).lower() if timeframe_match else None
 
     # Polymarket side: YES = buy yes (bullish), NO = buy no (bearish).
-    side = None
-    if re.search(r"\b(long|buy\s*yes|yes|bull|up|call)\b", low) or "🟢" in src:
-        side = "YES"
-    elif re.search(r"\b(short|buy\s*no|no|bear|down|put)\b", low) or "🔴" in src or re.search(r"▼\s*down", low):
-        side = "NO"
+    # Use the validated Direction field for accurate side detection
+    side = "YES" if re.search(direction_up_pattern, src) else "NO"
 
-    # Parse "Time:      21:40 UTC" first; when present, signal time is that time and default +5 min window.
+    # Parse "Time:      21:40 UTC" for signal time accuracy.
     time_utc_hour: int | None = None
     time_utc_min: int | None = None
     time_utc_display: str | None = None
@@ -251,16 +261,6 @@ def parse_signal_from_text(text: str) -> dict[str, Any] | None:
             time_utc_display = f"{time_utc_hour:02d}:{time_utc_min:02d} UTC"
         except Exception:
             pass
-
-    # When "Time: 21:40 UTC" is present but no explicit timeframe in text, default to +5 min.
-    if time_utc_display is not None and timeframe is None:
-        timeframe = "5m"
-
-    # Skip non-actionable chatter (need at least side, and either timeframe or explicit signal time).
-    if not side:
-        return None
-    if not timeframe and not time_utc_display:
-        return None
 
     direction = "UP" if side == "YES" else "DOWN" if side == "NO" else None
 
@@ -489,27 +489,8 @@ async def run_listener(
         out = {**parsed, "signal_ts": signal_ts, "signal_at": signal_at, "market_end_ts": market_end_ts, "market_end_at": market_end_at}
         print(f"[listener] {source} signal: {json.dumps(out, ensure_ascii=False)}")
 
-    # Historical backfill: last N days (default 7) + optional hard limit.
-    now_ts = int(time.time())
-    cutoff_ts = now_ts - (cfg.history_days * 24 * 60 * 60)
-    limit = None if cfg.history_limit <= 0 else cfg.history_limit
-    scanned = 0
-    async for msg in client.iter_messages(chat, limit=limit):
-        msg_date = getattr(msg, "date", None)
-        msg_ts = int(msg_date.timestamp()) if msg_date else 0
-        if msg_ts and msg_ts < cutoff_ts:
-            # iter_messages default order is newest -> oldest, so we can stop early.
-            break
-        await process_message(msg, "historical")
-        scanned += 1
-        if scanned % 500 == 0:
-            print(f"[listener] scanned {scanned} historical messages...")
-    print(
-        f"[listener] historical scan complete. scanned={scanned} "
-        f"(window={cfg.history_days}d)"
-    )
-
-    # Live listeners
+    # Live listeners (register before historical backfill so we don't miss signals
+    # arriving during the backfill scan).
     @client.on(events.NewMessage(chats=chat))
     async def _on_new(event):
         await process_message(event.message, "live:new")
@@ -518,8 +499,45 @@ async def run_listener(
     async def _on_edit(event):
         await process_message(event.message, "live:edit")
 
+    print("[listener] live handlers registered. Starting historical/backfill (if any)...")
+
+    async def _run_historical_backfill() -> None:
+        # Historical backfill: last N days (default 7) + optional hard limit.
+        # If history_days is 0, skip backfill.
+        now_ts = int(time.time())
+        cutoff_ts = now_ts - (cfg.history_days * 24 * 60 * 60)
+        limit = None if cfg.history_limit <= 0 else cfg.history_limit
+        scanned = 0
+        if cfg.history_days > 0:
+            async for msg in client.iter_messages(chat, limit=limit):
+                msg_date = getattr(msg, "date", None)
+                msg_ts = int(msg_date.timestamp()) if msg_date else 0
+                if msg_ts and msg_ts < cutoff_ts:
+                    # iter_messages default order is newest -> oldest, so we can stop early.
+                    break
+                await process_message(msg, "historical")
+                scanned += 1
+                if scanned % 500 == 0:
+                    print(f"[listener] scanned {scanned} historical messages...")
+            print(
+                f"[listener] historical scan complete. scanned={scanned} "
+                f"(window={cfg.history_days}d)"
+            )
+        else:
+            print("[listener] history_days=0; skipping historical backfill.")
+
+    # Run historical backfill in parallel with live listening.
+    backfill_task = asyncio.create_task(_run_historical_backfill())
     print("[listener] live mode started. Waiting for new messages...")
-    await client.run_until_disconnected()
+    try:
+        await client.run_until_disconnected()
+    finally:
+        if not backfill_task.done():
+            backfill_task.cancel()
+            try:
+                await backfill_task
+            except asyncio.CancelledError:
+                pass
 
 
 def parse_args() -> argparse.Namespace:

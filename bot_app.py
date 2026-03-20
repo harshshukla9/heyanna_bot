@@ -98,7 +98,7 @@ chat_sessions: Dict[int, List[dict]] = {}
 active_market_context: Dict[int, dict] = {}
 
 # In-memory state for one-off typed inputs (e.g., setting custom signal trade amount).
-_pending_signal_amount_input: Dict[int, bool] = {}
+_pending_signal_amount_input: Dict[int, str] = {}  # user_id -> timeframe ("5m", "15m", or "legacy")
 
 # Telegram callback_data has a strict 64-byte limit. Use short aliases for
 # markets and resolve back to condition IDs server-side.
@@ -178,7 +178,7 @@ BOT_COMMANDS = [
     BotCommand("wallet", "Show your Polygon wallet address"),
     BotCommand("balance", "Check token balances"),
     BotCommand("portfolio", "Funds + open positions & PnL"),
-    BotCommand("copy", "Manage copy trading & smart wallets"),
+    BotCommand("copy", "Manage copy trading"),
     BotCommand("markets", "Browse trending Polymarket events"),
     BotCommand("trending", "Alias for /markets"),
     BotCommand("category", "Markets by category (politics, crypto, etc.)"),
@@ -573,7 +573,7 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             return image_url.strip()
         return _market_banner_for_market(market)
 
-    async def _safe_edit_message(query, text, parse_mode=None, reply_markup=None):
+    async def _safe_edit_message(query, text, parse_mode=None, reply_markup=None, **_ignored_kwargs):
         """Safely edit text/caption messages, with graceful fallback."""
         try:
             await query.edit_message_text(
@@ -847,15 +847,25 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             await query.edit_message_text("You are already onboarded. Use /menu to access the bot.")
             return
 
-        # Ask for invite code
+        # Ask for invite code - send a new message instead of editing (more reliable)
         button = InlineKeyboardMarkup([[
             InlineKeyboardButton("Cancel", callback_data="cancel_invite_code")
         ]])
-        await query.edit_message_text(
-            "🔑 Please enter your invite code:\n\n"
-            "Type your invite code and send, or /cancel to go back.",
-            reply_markup=button,
-        )
+
+        try:
+            await query.edit_message_text(
+                "🔑 Please enter your invite code:\n\n"
+                "Type your invite code and send, or /cancel to go back.",
+                reply_markup=button,
+            )
+        except Exception:
+            # If edit fails (e.g., media message), send a new message instead
+            await query.message.reply_text(
+                "🔑 Please enter your invite code:\n\n"
+                "Type your invite code and send, or /cancel to go back.",
+                reply_markup=button,
+            )
+
         context.user_data["awaiting_invite_code"] = True
 
     async def _on_cancel_invite_code_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -866,10 +876,15 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         # Clear awaiting state
         context.user_data.pop("awaiting_invite_code", None)
 
-        # Show welcome menu without invite code button
-        await query.edit_message_text(
-            "Cancelled. Use /start to begin again."
-        )
+        # Try to edit, fallback to sending new message
+        try:
+            await query.edit_message_text(
+                "Cancelled. Use /start to begin again."
+            )
+        except Exception:
+            await query.message.reply_text(
+                "Cancelled. Use /start to begin again."
+            )
 
     async def _handle_invite_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle invite code text input."""
@@ -902,9 +917,10 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
 
         # Try to claim the invite code
         success, msg = db.claim_invite_code(invite_code, user_id)
+        # Always clear state after processing
+        context.user_data.pop("awaiting_invite_code", None)
+
         if success:
-            # Clear state
-            context.user_data.pop("awaiting_invite_code", None)
             await message.reply_text(
                 f"✅ Successfully onboarded! You can now use the bot.\n\n"
                 f"Use `/menu` to get started.",
@@ -1015,19 +1031,14 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 ],
                 [
                     InlineKeyboardButton("💼 Portfolio", callback_data="home:portfolio"),
-                    InlineKeyboardButton("💰 Wallet", callback_data="home:wallet"),
+                    InlineKeyboardButton("📡 Signal Trading", callback_data="home:signals"),
                 ],
                 [
-                    InlineKeyboardButton("🧠 Smart Wallets", callback_data="home:smart_wallets"),
+                    InlineKeyboardButton("💰 Wallet", callback_data="home:wallet"),
                     InlineKeyboardButton("🔄 Refresh", callback_data="home:refresh"),
                 ],
                 [
-                    InlineKeyboardButton("📡 Signal trading", callback_data="home:signals"),
-                    InlineKeyboardButton("👥 Referrals", callback_data="home:referrals"),
                     InlineKeyboardButton("⚙️ Settings", callback_data="home:settings"),
-                ],
-                [
-                    InlineKeyboardButton("❓ Help", callback_data="home:help"),
                     InlineKeyboardButton(
                         "💬 Community",
                         url="https://t.me/+i9D5bDox8lNmNDk9",
@@ -1107,20 +1118,18 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             address,
         )
         # Basic account actions as inline buttons
-        buttons = [
+        account_buttons = [
             [
                 InlineKeyboardButton("➕ Deposit", callback_data="deposit:wallet"),
                 InlineKeyboardButton("🔁 EOA → Safe", callback_data="transfer:safe"),
                 InlineKeyboardButton("➖ Withdraw", callback_data="withdraw:funds"),
             ],
             [
-                InlineKeyboardButton("🏆 Claim winnings", callback_data="claim:all"),
-            ],
-            [
                 InlineKeyboardButton("📈 View / close positions", callback_data="portfolio:view"),
             ],
         ]
-        keyboard = InlineKeyboardMarkup(buttons)
+
+        keyboard = InlineKeyboardMarkup(account_buttons)
         # Add a clearer account header and action hints.
         portfolio_text = (
             "💼 *Portfolio & Wallet*\n"
@@ -1133,8 +1142,19 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 portfolio_text
                 + "\n\n"
                 + "⚙️ *Gasless trading wallet (Safe)*\n"
-                + f"`{safe_address}`\n"
-                + "Deposit USDC.e here for gasless approvals, trading, and claims."
+                + f"`{safe_address[:20]}...`\n"
+                + "Use this address for deposits.\n\n"
+                + "💎 *Your Wallet (EOA)*\n"
+                + f"`{address[:20]}...`\n"
+                + "Your primary wallet address."
+            )
+        else:
+            portfolio_text = (
+                portfolio_text
+                + "\n\n"
+                + "💎 *Your Wallet (EOA)*\n"
+                + f"`{address[:20]}...`\n"
+                + "Your primary wallet address."
             )
         portfolio_text = (
             portfolio_text
@@ -1211,7 +1231,108 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             parse_mode="Markdown",
         )
 
-    async def _send_copy_trading_state(chat_id: int, bot, db_user: dict):
+    _leader_stats_cache: dict[str, tuple[float, dict[str, float | int | None]]] = {}
+    _LEADER_STATS_TTL_SEC = 90.0
+
+    def _compute_wallet_24h_stats(wallet: str) -> dict[str, float | int | None]:
+        """
+        Compute wallet-level 24h stats from public Polymarket endpoints.
+        Returns:
+          - trades_24h: int
+          - roi_24h: float | None (realized ROI based on closed positions cost basis)
+        """
+        import requests
+
+        addr = (wallet or "").strip().lower()
+        if not addr.startswith("0x") or len(addr) != 42:
+            return {"trades_24h": 0, "roi_24h": None}
+
+        now_ts = int(time.time())
+        since_ts = now_ts - 24 * 60 * 60
+
+        # 1) Trades in last 24h (paged).
+        trades_24h = 0
+        page_size = 100
+        max_pages = 5
+        for page in range(max_pages):
+            offset = page * page_size
+            try:
+                r = requests.get(
+                    "https://data-api.polymarket.com/trades",
+                    params={"user": addr, "limit": page_size, "offset": offset, "takerOnly": "true"},
+                    timeout=8,
+                )
+                rows = r.json() if r.status_code == 200 else []
+                if not isinstance(rows, list) or not rows:
+                    break
+            except Exception:
+                break
+
+            older_seen = False
+            for t in rows:
+                try:
+                    ts = int(t.get("timestamp") or 0)
+                except Exception:
+                    ts = 0
+                if ts >= since_ts:
+                    trades_24h += 1
+                else:
+                    older_seen = True
+            if len(rows) < page_size or older_seen:
+                break
+
+        # 2) Realized ROI over closed positions in last 24h.
+        realized_pnl = 0.0
+        total_bought = 0.0
+        try:
+            r = requests.get(
+                "https://data-api.polymarket.com/closed-positions",
+                params={"user": addr, "limit": 200},
+                timeout=8,
+            )
+            closed_rows = r.json() if r.status_code == 200 else []
+        except Exception:
+            closed_rows = []
+
+        if isinstance(closed_rows, list):
+            for p in closed_rows:
+                try:
+                    ts = int(p.get("timestamp") or 0)
+                except Exception:
+                    ts = 0
+                if ts < since_ts:
+                    continue
+                try:
+                    realized_pnl += float(p.get("realizedPnl") or 0.0)
+                except Exception:
+                    pass
+                try:
+                    total_bought += float(p.get("totalBought") or 0.0)
+                except Exception:
+                    pass
+
+        roi_24h = (realized_pnl / total_bought * 100.0) if total_bought > 0 else None
+        return {"trades_24h": int(trades_24h), "roi_24h": roi_24h}
+
+    def _get_wallet_24h_stats_cached(wallet: str) -> dict[str, float | int | None]:
+        now = time.time()
+        key = (wallet or "").strip().lower()
+        cached = _leader_stats_cache.get(key)
+        if cached:
+            ts, payload = cached
+            if (now - ts) <= _LEADER_STATS_TTL_SEC:
+                return payload
+        payload = _compute_wallet_24h_stats(key)
+        _leader_stats_cache[key] = (now, payload)
+        return payload
+
+    async def _send_copy_trading_state(
+        chat_id: int,
+        bot,
+        db_user: dict,
+        leaderboard_page: int = 1,
+        query=None,
+    ):
         """
         Show high-level copy-trading status for the current user, mirroring /me/copy-trading from the API.
         Shows both local leaders and global (external wallet) leaders.
@@ -1296,14 +1417,18 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             if following_count > 5:
                 lines.append(f"...and {following_count - 5} more.")
 
-        # Global trader leaderboard (Polymarket Data API)
+        # Global trader leaderboard (Polymarket Data API) with pagination.
+        leaderboard_page = max(1, int(leaderboard_page or 1))
+        leaderboard_page_size = 5
+        leaderboard_offset = (leaderboard_page - 1) * leaderboard_page_size
         try:
             import requests
 
             resp = requests.get(
                 "https://data-api.polymarket.com/v1/leaderboard",
                 params={
-                    "limit": 5,
+                    "limit": leaderboard_page_size + 1,
+                    "offset": leaderboard_offset,
                     "category": "OVERALL",
                     "timePeriod": "DAY",
                     "orderBy": "PNL",
@@ -1317,15 +1442,21 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 entries = []
         except Exception:
             entries = []
+        has_prev_page = leaderboard_page > 1
+        has_next_page = len(entries) > leaderboard_page_size
+        entries = entries[:leaderboard_page_size]
 
         if entries:
             lines.append("")
-            lines.append("<b>🌍 Top Global Traders (24h PnL)</b>")
-            for e in entries[:5]:
+            lines.append(f"<b>🌍 Top Global Traders (24h) · Page {leaderboard_page}</b>")
+            for e in entries:
                 name = e.get("userName") or e.get("proxyWallet", "")[:10] + "…"
                 pnl = float(e.get("pnl", 0) or 0)
                 vol = float(e.get("vol", 0) or 0)
                 wallet = e.get("proxyWallet") or ""
+                stats = await asyncio.to_thread(_get_wallet_24h_stats_cached, wallet)
+                roi = stats.get("roi_24h")
+                num_trades = int(stats.get("trades_24h") or 0)
                 safe_name = _html.escape(str(name))
                 safe_wallet = _html.escape(str(wallet))
                 profile_url = f"https://polymarket.com/profile/{wallet}" if wallet else "https://polymarket.com"
@@ -1334,7 +1465,9 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                     action_links = f"<a href=\"{follow_url}\">Follow</a> · <a href=\"{profile_url}\">Profile</a>"
                 else:
                     action_links = f"<a href=\"{profile_url}\">Profile</a>"
+                roi_text = f"{float(roi):+.1f}%" if roi is not None else "N/A"
                 lines.append(f"{safe_name}")
+                lines.append(f"├ ROI {roi_text} · Trades: {num_trades}")
                 lines.append(f"├ PnL ${pnl:+.2f} · Vol ${vol:.2f}")
                 lines.append(f"├ <code>{safe_wallet}</code>")
                 lines.append(f"└ {action_links}")
@@ -1354,8 +1487,15 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 [InlineKeyboardButton("👥 View All Leaders", callback_data="copycfg:all_leaders")]
             )
 
+        pagination_row = []
+        if has_prev_page:
+            pagination_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"copycfg:leaders:{leaderboard_page-1}"))
+        if has_next_page:
+            pagination_row.append(InlineKeyboardButton("➡️ Next", callback_data=f"copycfg:leaders:{leaderboard_page+1}"))
+
         buttons = (
             unfollow_buttons + [
+                pagination_row,
                 [
                     InlineKeyboardButton(
                         "✅ Enable" if not enabled else "⏸ Disable",
@@ -1367,7 +1507,7 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                     InlineKeyboardButton("🏠 Main Menu", callback_data="home:main"),
                 ],
                 [
-                    InlineKeyboardButton("⭐ View & follow top traders", callback_data="copycfg:leaders"),
+                    InlineKeyboardButton("⭐ View & follow top traders", callback_data="copycfg:leaders:1"),
                 ],
                 [
                     InlineKeyboardButton("➕ Follow by wallet address", callback_data="copycfg:follow_manual"),
@@ -1377,13 +1517,23 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 ],
             ]
         )
-        await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
+        # Remove empty rows from keyboard.
+        buttons = [row for row in buttons if row]
+        if query is not None:
+            await _safe_edit_message(
+                query,
+                text,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+        else:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
 
     async def follow_wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
@@ -1884,7 +2034,8 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         data = query.data or ""
         if not data.startswith("copycfg:"):
             return
-        action = data.split(":", 1)[1].strip()
+        parts = data.split(":")
+        action = parts[1].strip() if len(parts) > 1 else ""
         db_user = db.get_user(query.from_user.id) if query.from_user else None
         if not db_user:
             await _safe_edit_message(query, "Please run /start first.")
@@ -1955,64 +2106,16 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             return
 
         if action == "refresh":
-            # Re-send state summary as a new message to avoid editing long histories.
+            # Re-render state summary in-place.
             db_user = db.get_user(query.from_user.id)
             if db_user and query.message:
-                await _send_copy_trading_state(query.message.chat_id, context.bot, db_user)
-            return
-
-    async def handle_signals_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        try:
-            await query.answer()
-        except BadRequest:
-            return
-        data = query.data or ""
-        if not data.startswith("signals:"):
-            return
-
-        db_user = db.get_user(query.from_user.id) if query.from_user else None
-        if not db_user:
-            await _safe_edit_message(query, "Please run /start first.")
-            return
-
-        parts = data.split(":")
-        action = parts[1] if len(parts) > 1 else ""
-        if action in ("enable", "disable"):
-            flag = 1 if action == "enable" else 0
-            with db.transaction() as conn:
-                conn.execute(
-                    "UPDATE users SET signal_trading_enabled = ? WHERE user_id = ?;",
-                    (flag, db_user["user_id"]),
+                await _send_copy_trading_state(
+                    query.message.chat_id,
+                    context.bot,
+                    db_user,
+                    leaderboard_page=1,
+                    query=query,
                 )
-            db_user = db.get_user(db_user["user_id"]) or db_user
-            await _render_signal_trading_menu(query.message.chat_id, context.bot, db_user, query=query)
-            return
-
-        if action == "amt" and len(parts) >= 3:
-            choice = parts[2].strip()
-            if choice == "custom":
-                _pending_signal_amount_input[int(db_user["user_id"])] = True
-                await _safe_edit_message(
-                    query,
-                    "Send the number of shares you want to use per signal (example: `10`).",
-                    parse_mode="Markdown",
-                )
-                return
-            try:
-                amt = float(choice)
-            except Exception:
-                amt = 0.0
-            if amt <= 0:
-                await _safe_edit_message(query, "Invalid amount.")
-                return
-            with db.transaction() as conn:
-                conn.execute(
-                    "UPDATE users SET signal_trade_amount_usd = ? WHERE user_id = ?;",
-                    (amt, db_user["user_id"]),
-                )
-            db_user = db.get_user(db_user["user_id"]) or db_user
-            await _render_signal_trading_menu(query.message.chat_id, context.bot, db_user, query=query)
             return
 
         if action == "all_leaders":
@@ -2069,75 +2172,26 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 query,
                 "\n".join(lines),
                 parse_mode="HTML",
-                disable_web_page_preview=True,
                 reply_markup=InlineKeyboardMarkup(buttons),
             )
             return
 
         if action == "leaders":
-            # Show top global traders with hyperlink-style actions.
-            try:
-                import requests
-
-                resp = requests.get(
-                    "https://data-api.polymarket.com/v1/leaderboard",
-                    params={
-                        "limit": 5,
-                        "category": "OVERALL",
-                        "timePeriod": "DAY",
-                        "orderBy": "PNL",
-                    },
-                    timeout=8,
+            page = 1
+            if len(parts) >= 3:
+                try:
+                    page = max(1, int(parts[2]))
+                except Exception:
+                    page = 1
+            db_user = db.get_user(query.from_user.id)
+            if db_user and query.message:
+                await _send_copy_trading_state(
+                    query.message.chat_id,
+                    context.bot,
+                    db_user,
+                    leaderboard_page=page,
+                    query=query,
                 )
-                entries = resp.json() if resp.status_code == 200 else []
-                if not isinstance(entries, list):
-                    entries = entries.get("entries", [])
-            except Exception:
-                entries = []
-
-            if not entries:
-                await _safe_edit_message(
-                    query,
-                    "Could not load global leaderboard right now. Please try again later.",
-                )
-                return
-
-            import html as _html
-            lines: list[str] = []
-            lines.append("<b>🌍 Top global traders (24h PnL)</b>")
-            lines.append("")
-            for idx, e in enumerate(entries[:5], start=1):
-                name = e.get("userName") or (e.get("proxyWallet", "")[:10] + "…")
-                pnl = float(e.get("pnl", 0) or 0)
-                vol = float(e.get("vol", 0) or 0)
-                wallet = e.get("proxyWallet") or ""
-                safe_name = _html.escape(str(name))
-                safe_wallet = _html.escape(str(wallet))
-                profile_url = f"https://polymarket.com/profile/{wallet}" if wallet else "https://polymarket.com"
-                if TELEGRAM_BOT_USERNAME and wallet:
-                    follow_url = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start=follow_{wallet}"
-                    action_links = f"<a href=\"{follow_url}\">Follow</a> · <a href=\"{profile_url}\">Profile</a>"
-                else:
-                    action_links = f"<a href=\"{profile_url}\">Profile</a>"
-                lines.append(f"{idx}) {safe_name}")
-                lines.append(f"├ PnL ${pnl:+.2f} · Vol ${vol:.2f}")
-                lines.append(f"├ <code>{safe_wallet}</code>")
-                lines.append(f"└ {action_links}")
-                lines.append("")
-
-            keyboard = InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("➕ Follow by wallet address", callback_data="copycfg:follow_manual")],
-                    [InlineKeyboardButton("⬅️ Back", callback_data="copycfg:refresh")],
-                ]
-            )
-            await _safe_edit_message(
-                query,
-                "\n".join(lines),
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                reply_markup=keyboard,
-            )
             return
 
         if action == "follow_manual":
@@ -2176,6 +2230,127 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 "🚫 You are no longer following any leaders for copy trading.",
             )
             return
+
+    async def handle_signals_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        try:
+            await query.answer()
+        except BadRequest:
+            return
+        data = query.data or ""
+        if not data.startswith("signals:"):
+            return
+
+        db_user = db.get_user(query.from_user.id) if query.from_user else None
+        if not db_user:
+            await _safe_edit_message(query, "Please run /start first.")
+            return
+
+        parts = data.split(":")
+        timeframe = parts[1] if len(parts) > 1 else ""
+
+        # Handle 5m and 15m specific actions
+        if timeframe in ("5m", "15m"):
+            action = parts[2] if len(parts) > 2 else ""
+
+            if action == "enable":
+                flag = 1
+                col_enabled = "signal_5m_enabled" if timeframe == "5m" else "signal_15m_enabled"
+                with db.transaction() as conn:
+                    conn.execute(
+                        f"UPDATE users SET {col_enabled} = ? WHERE user_id = ?;",
+                        (flag, db_user["user_id"]),
+                    )
+                db_user = db.get_user(db_user["user_id"]) or db_user
+                await _render_signal_trading_menu(query.message.chat_id, context.bot, db_user, query=query)
+                return
+            elif action == "disable":
+                flag = 0
+                col_enabled = "signal_5m_enabled" if timeframe == "5m" else "signal_15m_enabled"
+                with db.transaction() as conn:
+                    conn.execute(
+                        f"UPDATE users SET {col_enabled} = ? WHERE user_id = ?;",
+                        (flag, db_user["user_id"]),
+                    )
+                db_user = db.get_user(db_user["user_id"]) or db_user
+                await _render_signal_trading_menu(query.message.chat_id, context.bot, db_user, query=query)
+                return
+            elif action == "shares":
+                # Show shares selection menu
+                await _render_signal_shares_menu(query.message.chat_id, context.bot, db_user, timeframe, query=query)
+                return
+            elif action == "amt" and len(parts) >= 4:
+                # Format: signals:<timeframe>:amt:<value>
+                choice = parts[3].strip()
+                if choice == "custom":
+                    _pending_signal_amount_input[int(db_user["user_id"])] = timeframe
+                    await _safe_edit_message(
+                        query,
+                        f"Send the number of shares for {timeframe.upper()} signals (minimum 5).",
+                        parse_mode="Markdown",
+                    )
+                    return
+                try:
+                    shares = float(choice)
+                except Exception:
+                    shares = 0.0
+                if shares < 5:
+                    await _safe_edit_message(query, "Minimum 5 shares.")
+                    return
+                col = "signal_5m_amount_usd" if timeframe == "5m" else "signal_15m_amount_usd"
+                with db.transaction() as conn:
+                    conn.execute(
+                        f"UPDATE users SET {col} = ? WHERE user_id = ?;",
+                        (shares, db_user["user_id"]),
+                    )
+                db_user = db.get_user(db_user["user_id"]) or db_user
+                await _render_signal_trading_menu(query.message.chat_id, context.bot, db_user, query=query)
+                return
+
+        # Back button
+        if timeframe == "back":
+            await _render_signal_trading_menu(query.message.chat_id, context.bot, db_user, query=query)
+            return
+
+        # Legacy support for generic enable/disable
+        if timeframe in ("enable", "disable"):
+            flag = 1 if timeframe == "enable" else 0
+            with db.transaction() as conn:
+                conn.execute(
+                    "UPDATE users SET signal_trading_enabled = ? WHERE user_id = ?;",
+                    (flag, db_user["user_id"]),
+                )
+            db_user = db.get_user(db_user["user_id"]) or db_user
+            await _render_signal_trading_menu(query.message.chat_id, context.bot, db_user, query=query)
+            return
+
+        # Legacy support for amount
+        if timeframe == "amt" and len(parts) >= 3:
+            choice = parts[2].strip()
+            if choice == "custom":
+                _pending_signal_amount_input[int(db_user["user_id"])] = "legacy"
+                await _safe_edit_message(
+                    query,
+                    "Send the number of shares per signal (minimum 5).",
+                    parse_mode="Markdown",
+                )
+                return
+            try:
+                shares = float(choice)
+            except Exception:
+                shares = 0.0
+            if shares < 5:
+                await _safe_edit_message(query, "Minimum 5 shares.")
+                return
+            with db.transaction() as conn:
+                conn.execute(
+                    "UPDATE users SET signal_trade_amount_usd = ? WHERE user_id = ?;",
+                    (shares, db_user["user_id"]),
+                )
+            db_user = db.get_user(db_user["user_id"]) or db_user
+            await _render_signal_trading_menu(query.message.chat_id, context.bot, db_user, query=query)
+            return
+
 
     # ── Copy-trading notification loop (push messages for copied trades) ──
 
@@ -2501,36 +2676,84 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 await asyncio.sleep(3)
 
     async def _render_signal_trading_menu(chat_id: int, bot: Bot, db_user: dict, query=None) -> None:
-        enabled = bool(db_user.get("signal_trading_enabled") or 0)
-        shares = int(db_user.get("signal_trade_amount_usd") or 5)
-        status = "ON" if enabled else "OFF"
+        # 5m settings
+        enabled_5m = bool(db_user.get("signal_5m_enabled") or 0)
+        shares_5m = int(db_user.get("signal_5m_amount_usd") or 5)
+        # 15m settings
+        enabled_15m = bool(db_user.get("signal_15m_enabled") or 0)
+        shares_15m = int(db_user.get("signal_15m_amount_usd") or 5)
+
+        status_5m = "ON ✅" if enabled_5m else "OFF ⏸"
+        status_15m = "ON ✅" if enabled_15m else "OFF ⏸"
 
         text = (
-            "📡 *Signal trading*\n\n"
-            "Auto-trade *5 minute* series signals using your smart wallet.\n\n"
-            f"Status: *{status}*\n"
-            f"Shares per signal: *{shares}*\n\n"
-            "Choose an action below."
+            "📡 *Signal Trading Settings*\n\n"
+            "Configure auto-trading for different timeframes.\n\n"
+            f"⏱ *5-minute signals*\n"
+            f"Status: *{status_5m}*\n"
+            f"Shares per signal: *{shares_5m}*\n\n"
+            f"⏱ *15-minute signals*\n"
+            f"Status: *{status_15m}*\n"
+            f"Shares per signal: *{shares_15m}*\n\n"
+            "⚡ *Note:* Shares are bought at $0.55/share max.\n"
+            "Example: 10 shares = ~$5.50 USD\n\n"
+            "Tap a button below to configure."
         )
 
         kb = InlineKeyboardMarkup(
             [
                 [
                     InlineKeyboardButton(
-                        "✅ Enable" if not enabled else "⏸ Disable",
-                        callback_data=f"signals:{'enable' if not enabled else 'disable'}",
-                    )
+                        "⏱ 5m ON" if enabled_5m else "⏱ 5m Enable",
+                        callback_data="signals:5m:disable" if enabled_5m else "signals:5m:enable",
+                    ),
+                    InlineKeyboardButton(
+                        "⏱ 15m ON" if enabled_15m else "⏱ 15m Enable",
+                        callback_data="signals:15m:disable" if enabled_15m else "signals:15m:enable",
+                    ),
                 ],
                 [
-                    InlineKeyboardButton("5 shares", callback_data="signals:amt:5"),
-                    InlineKeyboardButton("10 shares", callback_data="signals:amt:10"),
-                    InlineKeyboardButton("20 shares", callback_data="signals:amt:20"),
-                ],
-                [
-                    InlineKeyboardButton("✍️ Custom shares", callback_data="signals:amt:custom"),
+                    InlineKeyboardButton("🔢 5m Shares", callback_data="signals:5m:shares"),
+                    InlineKeyboardButton("🔢 15m Shares", callback_data="signals:15m:shares"),
                 ],
                 [
                     InlineKeyboardButton("🏠 Main Menu", callback_data="home:main"),
+                ],
+            ]
+        )
+        if query is not None:
+            await _safe_edit_message(query, text, parse_mode="Markdown", reply_markup=kb)
+        else:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", reply_markup=kb)
+
+    async def _render_signal_shares_menu(chat_id: int, bot: Bot, db_user: dict, timeframe: str, query=None) -> None:
+        """Render shares selection menu for 5m or 15m signals."""
+        col = "signal_5m_amount_usd" if timeframe == "5m" else "signal_15m_amount_usd"
+        current_shares = int(db_user.get(col) or 5)
+
+        text = (
+            f"🔢 *{timeframe.upper()} Signal Shares*\n\n"
+            f"Current: *{current_shares} shares*\n\n"
+            "Choose a preset or send custom amount.\n\n"
+            "Minimum: *5 shares* (~$2.75)")
+
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("5 shares", callback_data=f"signals:{timeframe}:amt:5"),
+                    InlineKeyboardButton("10 shares", callback_data=f"signals:{timeframe}:amt:10"),
+                    InlineKeyboardButton("15 shares", callback_data=f"signals:{timeframe}:amt:15"),
+                ],
+                [
+                    InlineKeyboardButton("20 shares", callback_data=f"signals:{timeframe}:amt:20"),
+                    InlineKeyboardButton("30 shares", callback_data=f"signals:{timeframe}:amt:30"),
+                    InlineKeyboardButton("50 shares", callback_data=f"signals:{timeframe}:amt:50"),
+                ],
+                [
+                    InlineKeyboardButton("✍️ Custom", callback_data=f"signals:{timeframe}:amt:custom"),
+                ],
+                [
+                    InlineKeyboardButton("⬅️ Back", callback_data="signals:back"),
                 ],
             ]
         )
@@ -2567,7 +2790,13 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             await wallet_cmd(update, context)
             return
         if choice in ("copy", "smart_wallets"):
-            await _send_copytrade_featured(query.message.chat_id, context.bot)
+            await _send_copy_trading_state(
+                query.message.chat_id,
+                context.bot,
+                db_user,
+                leaderboard_page=1,
+                query=query,
+            )
             return
         if choice == "help":
             await help_cmd(update, context)
@@ -2583,7 +2812,7 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 text = (
                     "⚙️ *Settings*\n\n"
                     "Use these options to manage your trading setup:\n\n"
-                    "• 🔑 *Export private key* (dev only, never share with others)\n"
+                    "• 🔑 *Export private key* (never share with others)\n"
                     "• 👥 *Manage copy‑trading leaders* (follow / unfollow top traders)\n\n"
                     "Tap a button below to continue."
                 )
@@ -2595,7 +2824,7 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                         [
                             [
                                 InlineKeyboardButton(
-                                    "🔑 Export private key (dev)",
+                                    "🔑 Export private key",
                                     callback_data="settings:pk",
                                 ),
                             ],
@@ -2642,8 +2871,7 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         if choice == "view_more":
             await _safe_edit_message(
                 query,
-                "Smart Wallet directories and leader discovery will live in the Mini App.\n\n"
-                "For now, use the Copy‑trading panel to manage who you follow.",
+                "Use the Copy‑trading panel to manage who you follow.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(
                     [
@@ -2860,6 +3088,34 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         )
 
 
+    async def handle_copy_address_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle copy address callbacks - shows address with copy instruction."""
+        query = update.callback_query
+        try:
+            await query.answer()
+        except BadRequest:
+            return
+        data = query.data or ""
+        if not data.startswith("copy:"):
+            return
+        # Parse: copy:safe:<address> or copy:eoa:<address>
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            return
+        addr_type = parts[1]
+        address = parts[2]
+
+        if addr_type == "safe":
+            label = "Safe (Trading Wallet)"
+            msg = f"📋 *{label}*\n\n`{address}`\n\nTap to copy the address above."
+        elif addr_type == "eoa":
+            label = "EOA (Your Wallet)"
+            msg = f"📋 *{label}*\n\n`{address}`\n\nTap to copy the address above."
+        else:
+            return
+
+        await _safe_edit_message(query, msg, parse_mode="Markdown")
+
     async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle settings-related actions (e.g., export private key)."""
         query = update.callback_query
@@ -2877,7 +3133,7 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             await _safe_edit_message(query, "Please run /start first.")
             return
 
-        if action == "pk":
+        if action in ("pk", "copy_pk"):
             pk = (db_user.get("eth_private_key") or "").strip()
             if not pk:
                 await _safe_edit_message(
@@ -2885,13 +3141,36 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                     "No private key found for this wallet.",
                 )
                 return
+            # Show with copy button
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋 Copy Private Key", callback_data="settings:copy_pk")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="settings:pk")],
+            ])
             await _safe_edit_message(
                 query,
                 "⚠️ Export Private Key\n\n"
                 "Your private key gives FULL access to your funds.\n"
                 "Only use this in a secure, developer environment.\n\n"
-                f"{pk}",
+                f"`{pk}`\n\nTap the button above to copy.",
+                parse_mode="Markdown",
+                reply_markup=keyboard,
             )
+
+    async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        /cancel - Cancel current action or clear pending state.
+        """
+        user = update.effective_user
+        if not user:
+            return
+
+        # Clear any pending invite code state
+        context.user_data.pop("awaiting_invite_code", None)
+
+        await update.message.reply_text(
+            "Cancelled. Use /start to begin again or /menu to access the bot.",
+            parse_mode="Markdown",
+        )
 
     async def join_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
@@ -3365,43 +3644,6 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 pass
             return
 
-        if data == "claim:all":
-            # Claim via gasless relay using Builder + CTF redeemPositions helper
-            if query.message:
-                await _safe_edit_message(
-                    query,
-                    "🏆 Claiming winnings from resolved markets…",
-                    parse_mode="Markdown",
-                )
-            result = await asyncio.to_thread(bot_tools.claim_polymarket_winnings, address)
-            raw_result = str(result or "")
-            low = raw_result.lower()
-            if any(
-                token in low
-                for token in (
-                    "no unclaimed winnings",
-                    "no open positions to claim",
-                    "no closed positions found to claim",
-                    "no valid redeemable positions found",
-                    "transaction did not return a receipt",
-                )
-            ):
-                display_text = "No unclaimed winnings."
-            elif low.startswith("❌") or "claim via relayer failed" in low:
-                display_text = (
-                    "No unclaimed winnings right now. "
-                    "If a market just resolved, please try again in a minute."
-                )
-            else:
-                display_text = strip_emoji(raw_result)
-            if query.message:
-                await _safe_edit_message(
-                    query,
-                    display_text,
-                    parse_mode="Markdown",
-                )
-            return
-
     async def handle_close_pos_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Close the full position immediately (no amount prompt)."""
         query = update.callback_query
@@ -3658,19 +3900,29 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             )
             return
 
-        # Custom amount input for signal trading.
-        if _pending_signal_amount_input.get(int(user.id)):
+        # Custom shares input for signal trading.
+        timeframe = _pending_signal_amount_input.get(int(user.id))
+        if timeframe:
             try:
-                amt = float(user_text.strip())
-                if amt <= 0:
+                shares = float(user_text.strip())
+                if shares < 5:
                     raise ValueError
             except Exception:
-                await update.message.reply_text("Please send a positive number (example: 10).")
+                await update.message.reply_text("Please send at least 5 shares.")
                 return
+
+            # Determine which column to update based on timeframe
+            if timeframe == "5m":
+                col = "signal_5m_amount_usd"
+            elif timeframe == "15m":
+                col = "signal_15m_amount_usd"
+            else:
+                col = "signal_trade_amount_usd"  # legacy
+
             with db.transaction() as conn:
                 conn.execute(
-                    "UPDATE users SET signal_trade_amount_usd = ? WHERE user_id = ?;",
-                    (amt, int(user.id)),
+                    f"UPDATE users SET {col} = ? WHERE user_id = ?;",
+                    (shares, int(user.id)),
                 )
             _pending_signal_amount_input.pop(int(user.id), None)
             db_user = db.get_user(int(user.id)) or db_user
@@ -4079,17 +4331,31 @@ _Tap buttons below to trade or analyze._"""
             )
             return
 
-        # Simple Telegram-friendly formatting: turn '## Heading' into bold lines.
+        # Stable formatter for Telegram: convert markdown-like headings/bullets into plain text.
+        # We intentionally avoid parse_mode here so mixed markdown/unicode bullets always render.
         def _format_analysis_for_telegram(text: str) -> str:
             out_lines: list[str] = []
             for line in text.splitlines():
-                if line.startswith("## "):
-                    title = line[3:].strip()
+                stripped = line.strip()
+                if stripped.startswith("## "):
+                    title = stripped[3:].strip()
                     if out_lines and out_lines[-1] != "":
                         out_lines.append("")
-                    out_lines.append(f"*{title}*")
+                    out_lines.append(title.upper())
+                elif stripped.startswith("### "):
+                    title = stripped[4:].strip()
+                    if out_lines and out_lines[-1] != "":
+                        out_lines.append("")
+                    out_lines.append(title)
+                elif stripped.startswith("- "):
+                    bullet = stripped[2:].strip()
+                    out_lines.append(f"• {bullet}")
+                elif stripped.startswith("• "):
+                    out_lines.append(f"• {stripped[2:].strip()}")
                 else:
-                    out_lines.append(line)
+                    # Keep line content, but strip markdown emphasis markers for clean plaintext render.
+                    cleaned = line.replace("**", "").replace("`", "")
+                    out_lines.append(cleaned)
             return "\n".join(out_lines)
 
         telegram_text = _format_analysis_for_telegram(analysis)
@@ -4099,7 +4365,6 @@ _Tap buttons below to trade or analyze._"""
             context.bot,
             query.message.chat_id,
             telegram_text,
-            parse_mode="Markdown",
         )
 
         # After analysis, prompt user with Buy Yes / Buy No options.
@@ -4342,21 +4607,27 @@ _Tap buttons below to trade or analyze._"""
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("commands", help_cmd))
     app.add_handler(CommandHandler("autotrader", autotrader_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
 
     # Inline button callbacks: markets menu, portfolio menu, category, market selection, trade
     app.add_handler(CallbackQueryHandler(handle_markets_menu_callback, pattern=r"^markets:(trending|volume|closing|category|back)$"))
     app.add_handler(CallbackQueryHandler(handle_markets_page_callback, pattern=r"^markets_page:[^:]+:\d+$"))
-    app.add_handler(CallbackQueryHandler(handle_portfolio_menu_callback, pattern=r"^(portfolio:view|deposit:wallet|withdraw:funds|claim:all|transfer:safe)$"))
+    app.add_handler(CallbackQueryHandler(handle_portfolio_menu_callback, pattern=r"^(portfolio:view|deposit:wallet|withdraw:funds|transfer:safe)$"))
     app.add_handler(CallbackQueryHandler(handle_help_menu_callback, pattern=r"^help:(first_trade|account|funds|copy)$"))
-    app.add_handler(CallbackQueryHandler(handle_copycfg_callback, pattern=r"^copycfg:(enable|disable|refresh|leaders|follow_manual|unfollow_all|all_leaders)$"))
+    app.add_handler(
+        CallbackQueryHandler(
+            handle_copycfg_callback,
+            pattern=r"^copycfg:(enable|disable|refresh|leaders(?::\d+)?|follow_manual|unfollow_all|all_leaders)$",
+        )
+    )
     app.add_handler(CallbackQueryHandler(handle_unfollow_callback, pattern=r"^copyunfollow:\d+$"))
     app.add_handler(CallbackQueryHandler(handle_home_callback, pattern=r"^home:(markets|copy|portfolio|wallet|smart_wallets|signals|refresh|limit_orders|referrals|settings|help|main)$"))
-    app.add_handler(CallbackQueryHandler(handle_signals_callback, pattern=r"^signals:(enable|disable|amt:.+)$"))
+    app.add_handler(CallbackQueryHandler(handle_signals_callback, pattern=r"^signals:(5m:enable|5m:disable|5m:shares|5m:amt:.+|15m:enable|15m:disable|15m:shares|15m:amt:.+|enable|disable|amt:.+|back)$"))
     app.add_handler(CallbackQueryHandler(handle_copy_callback, pattern=r"^copy:(view_more|.+)$"))
     app.add_handler(CallbackQueryHandler(handle_copyfollow_callback, pattern=r"^copyfollow:0x[a-fA-F0-9]{40}$"))
     app.add_handler(CallbackQueryHandler(handle_copyrisk_callback, pattern=r"^copyrisk:(none|cancel|[\d.]+)$"))
     app.add_handler(CallbackQueryHandler(handle_copymode_callback, pattern=r"^copymode:(fractional|one_to_one|beginner|cancel)$"))
-    app.add_handler(CallbackQueryHandler(handle_settings_callback, pattern=r"^settings:(pk)$"))
+    app.add_handler(CallbackQueryHandler(handle_settings_callback, pattern=r"^settings:(pk|copy_pk)$"))
     app.add_handler(CallbackQueryHandler(handle_category_callback, pattern=r"^category:[a-z0-9\-]+$"))
     app.add_handler(CallbackQueryHandler(handle_close_pos_callback, pattern=r"^close_pos:\d+$"))
     app.add_handler(CallbackQueryHandler(handle_market_detail_callback, pattern=r"^market:detail:[^:]+$"))
@@ -4365,6 +4636,9 @@ _Tap buttons below to trade or analyze._"""
     # Trade handlers: support both numeric IDs and string condition IDs
     app.add_handler(CallbackQueryHandler(handle_trade_callback, pattern=r"^trade:(.+):(Yes|No)$"))
     app.add_handler(CallbackQueryHandler(handle_trade_amt_callback, pattern=r"^trade_amt:(.+):(Yes|No):[\d.]+$"))
+
+    # Copy address handler
+    app.add_handler(CallbackQueryHandler(handle_copy_address_callback, pattern=r"^copy:(safe|eoa):.+"))
 
     # Invite code handlers
     app.add_handler(CallbackQueryHandler(_on_invite_code_callback, pattern=r"^enter_invite_code$"))

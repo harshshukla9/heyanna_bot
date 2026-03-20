@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
 import logging
@@ -325,6 +326,13 @@ class AutoTrader:
         if not message_key:
             return False
 
+        # Safety: only execute trades for live signals.
+        # The JSONL file also contains backfill entries with source="historical"
+        # which should not be traded.
+        src = str(signal.get("source") or "")
+        if src and not src.startswith("live:"):
+            return False
+
         # Check if already processed (skip to prevent re-trading)
         if message_key in self.recent_signals:
             return False
@@ -560,12 +568,33 @@ def main() -> int:
     return 0
 
 
+def _process_signal_for_user(db, user_id, amount, signal, dry_run, send_notification):
+    """Helper function to process a signal for a single user (for threading)."""
+    try:
+        uid = int(user_id)
+        amt = float(amount or 0.0)
+
+        manager = AutoTraderManager(
+            db=db,
+            user_id=uid,
+            trade_amount_usd=amt,
+            dry_run=dry_run,
+            send_notification=send_notification,
+        )
+
+        traded, result = manager.process_signal(signal)
+        return (uid, traded, result)
+    except Exception as e:
+        return (user_id, False, f"Error: {e}")
+
+
 def run_multitrader_mode(db_path: str, signals_path: str, dry_run: bool, poll_interval: int) -> int:
     """
     Multi-user mode: automatically trade for all users with signal_trading_enabled=1.
     Each user trades with their own amount from the database.
+    Users are processed in parallel to reduce latency.
     """
-    print("[autotrader] Starting multi-user mode - trading for all enabled users")
+    print("[autotrader] Starting multi-user mode - trading for all enabled users (parallel execution)")
 
     db = DatabaseManager(db_path=db_path)
     db.init_schema()
@@ -582,9 +611,34 @@ def run_multitrader_mode(db_path: str, signals_path: str, dry_run: bool, poll_in
             with open(signals_path_obj, "r", encoding="utf-8") as f:
                 lines = f.readlines()
 
-            # Get all enabled users
+            # Get all enabled users based on signal timeframe
+            # Read the first signal to determine timeframe
+            first_signal = None
+            for line in lines:
+                line = line.strip()
+                if line:
+                    try:
+                        first_signal = json.loads(line)
+                        break
+                    except json.JSONDecodeError:
+                        continue
+
+            timeframe = first_signal.get("timeframe", "") if first_signal else ""
+
+            # Select appropriate columns based on timeframe
+            if timeframe == "5m":
+                enabled_col = "signal_5m_enabled"
+                amount_col = "signal_5m_amount_usd"
+            elif timeframe == "15m":
+                enabled_col = "signal_15m_enabled"
+                amount_col = "signal_15m_amount_usd"
+            else:
+                # Default to legacy settings
+                enabled_col = "signal_trading_enabled"
+                amount_col = "signal_trade_amount_usd"
+
             rows = db.execute(
-                "SELECT user_id, signal_trade_amount_usd FROM users WHERE signal_trading_enabled = 1 AND COALESCE(signal_trade_amount_usd, 0) > 0;"
+                f"SELECT user_id, {amount_col} FROM users WHERE {enabled_col} = 1 AND COALESCE({amount_col}, 0) > 0;"
             ).fetchall()
 
             if not rows:
@@ -607,27 +661,25 @@ def run_multitrader_mode(db_path: str, signals_path: str, dry_run: bool, poll_in
                 if not signal.get("parsed"):
                     continue
 
-                # Trade for each user
+                # Prepare user tasks
+                user_tasks = []
                 for r in rows:
-                    try:
-                        uid = int(r["user_id"])
-                        amount = float(r["signal_trade_amount_usd"] or 0.0)
+                    user_tasks.append((r["user_id"], r[amount_col]))
 
-                        manager = AutoTraderManager(
-                            db=db,
-                            user_id=uid,
-                            trade_amount_usd=amount,
-                            dry_run=dry_run,
-                        )
+                # Process all users in parallel using thread pool
+                send_notification = not dry_run
+                with ThreadPoolExecutor(max_workers=len(user_tasks)) as executor:
+                    futures = {
+                        executor.submit(_process_signal_for_user, db, uid, amt, signal, dry_run, send_notification): uid
+                        for uid, amt in user_tasks
+                    }
 
-                        traded, result = manager.process_signal(signal)
+                    for future in as_completed(futures):
+                        uid, traded, result = future.result()
                         if traded:
                             print(f"[autotrader:{uid}] Trade executed: {result[:100]}...")
                         else:
                             print(f"[autotrader:{uid}] Signal skipped: {result}")
-                    except Exception as e:
-                        print(f"[autotrader] Error for user {r['user_id']}: {e}")
-                        continue
 
             time.sleep(poll_interval)
 

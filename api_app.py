@@ -11,6 +11,7 @@ import time
 from datetime import datetime
 from typing import Any, Dict, Mapping
 from urllib.parse import parse_qsl
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import jwt
 import requests
@@ -843,6 +844,7 @@ def _run_whale_insider_indexer_tick(db: DatabaseManager) -> None:
             condition_id = t.get("conditionId") or t.get("condition_id") or ""
             market_title = (t.get("title") or t.get("market_title") or "")[:255]
             tx_hash = (t.get("transactionHash") or t.get("txHash") or t.get("transaction_hash") or "").strip() or None
+            side = (t.get("side") or t.get("outcome") or "").strip() or None
 
             if trade_usd >= WHALE_USD_MIN:
                 if db.insert_whale_insider_alert(
@@ -853,10 +855,11 @@ def _run_whale_insider_indexer_tick(db: DatabaseManager) -> None:
                     condition_id=condition_id or None,
                     market_title=market_title or None,
                     tx_hash=tx_hash,
+                    side=side,
                 ):
                     total_flagged_whale += 1
                     logging.getLogger(__name__).info(
-                        "[WHALE/INSIDER INDEXER] Flagged whale: %s $%.0f", wallet[:12] + "...", trade_usd
+                        "[WHALE/INSIDER INDEXER] Flagged whale: %s $%.0f side=%s", wallet[:12] + "...", trade_usd, side or "N/A"
                     )
 
             if trade_usd >= INSIDER_USD_MIN and not db.has_seen_whale_wallet(wallet):
@@ -869,6 +872,7 @@ def _run_whale_insider_indexer_tick(db: DatabaseManager) -> None:
                     condition_id=condition_id or None,
                     market_title=market_title or None,
                     tx_hash=tx_hash,
+                    side=side,
                 ):
                     total_flagged_insider += 1
                     logging.getLogger(__name__).info(
@@ -1398,16 +1402,37 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
             # Notifications sent via bot, no outbox table needed
             pass
 
+        def _trade_for_user(db, uid, amount_usd, signal_dict, use_limit_orders, limit_order_price):
+            """Helper function to process a trade for a single user (for threading)."""
+            try:
+                manager = AutoTraderManager(
+                    db=db,
+                    user_id=uid,
+                    trade_amount_usd=amount_usd,
+                    dry_run=False,
+                    use_limit_orders=use_limit_orders,
+                    limit_order_price=limit_order_price,
+                    send_notification=True,
+                )
+                traded, result = manager.process_signal(signal_dict)
+                return (uid, traded, result)
+            except Exception as e:
+                return (uid, False, str(e))
+
         async def _handle_autotrade_signal(payload: dict) -> None:
             """
             Execute signal auto-trades using autotrader.py logic.
             Instant execution - trades immediately when signal is received.
-            Multi-user support: trades for all enabled users.
+            Multi-user support: trades for all enabled users in parallel.
             """
             try:
                 if not isinstance(payload, dict):
                     return
                 if not payload.get("parsed"):
+                    return
+                # Only execute autotrades for live signals.
+                src = str(payload.get("source") or "")
+                if not src.startswith("live:"):
                     return
 
                 # Get timeframe - support all timeframes
@@ -1421,46 +1446,68 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
 
                 now_ts = int(time.time())
 
-                # Get all enabled users with trade amount
+                # Get all enabled users based on signal timeframe
+                if timeframe == "5m":
+                    enabled_col = "signal_5m_enabled"
+                    amount_col = "signal_5m_amount_usd"
+                elif timeframe == "15m":
+                    enabled_col = "signal_15m_enabled"
+                    amount_col = "signal_15m_amount_usd"
+                else:
+                    # Default to legacy settings
+                    enabled_col = "signal_trading_enabled"
+                    amount_col = "signal_trade_amount_usd"
+
                 rows = db.execute(
-                    "SELECT user_id, signal_trade_amount_usd FROM users WHERE signal_trading_enabled = 1 AND COALESCE(signal_trade_amount_usd, 0) > 0;"
+                    f"SELECT user_id, {amount_col} FROM users WHERE {enabled_col} = 1 AND COALESCE({amount_col}, 0) > 0;"
                 ).fetchall()
 
                 if not rows:
                     return
 
-                # Execute trade for each enabled user
+                # Prepare user tasks
+                user_tasks = []
                 for r in rows:
-                    try:
-                        uid = int(r["user_id"])
-                        amount_usd = float(r["signal_trade_amount_usd"] or 0.0)
-                        if amount_usd <= 0:
-                            continue
-
-                        # Use autotrader_manager for instant execution
-                        signal_dict = {
-                            "signal": side,
-                            "timeframe": timeframe,
-                            "signal_ts": now_ts,
-                            "market_end_ts": now_ts + 300,
-                        }
-
-                        manager = AutoTraderManager(
-                            db=db,
-                            user_id=uid,
-                            trade_amount_usd=amount_usd,
-                            dry_run=False,
-                            use_limit_orders=USE_LIMIT_ORDERS,
-                            limit_order_price=LIMIT_ORDER_PRICE,
-                        )
-
-                        traded, result = manager.process_signal(signal_dict)
-
-                        # Trade executed via autotrader_manager
-                    except Exception:
+                    uid = int(r["user_id"])
+                    amount_usd = float(r[amount_col] or 0.0)
+                    if amount_usd <= 0:
                         continue
-            except Exception:
-                return
+                    user_tasks.append((uid, amount_usd))
+
+                if not user_tasks:
+                    return
+
+                # Build signal dict from payload timing to avoid late/incorrect execution windows.
+                signal_ts = int(payload.get("signal_ts") or 0) or now_ts
+                market_end_ts = int(payload.get("market_end_ts") or 0)
+                if not market_end_ts:
+                    tf_secs = {"5m": 300, "15m": 900}
+                    market_end_ts = signal_ts + tf_secs.get(timeframe, 300)
+                signal_dict = {
+                    "signal": side,
+                    "timeframe": timeframe,
+                    "signal_ts": signal_ts,
+                    "market_end_ts": market_end_ts,
+                    "message_key": payload.get("message_key"),
+                    "source": src,
+                }
+
+                # Execute trades for all users in parallel using thread pool
+                with ThreadPoolExecutor(max_workers=len(user_tasks)) as executor:
+                    futures = {
+                        executor.submit(_trade_for_user, db, uid, amt, signal_dict, USE_LIMIT_ORDERS, LIMIT_ORDER_PRICE): uid
+                        for uid, amt in user_tasks
+                    }
+
+                    for future in as_completed(futures):
+                        uid, traded, result = future.result()
+                        if traded:
+                            logging.getLogger(__name__).info(f"[autotrader:{uid}] Trade executed: {result[:100]}...")
+                        else:
+                            logging.getLogger(__name__).info(f"[autotrader:{uid}] Signal skipped: {result}")
+
+            except Exception as e:
+                logging.getLogger(__name__).error(f"[autotrader] Error: {e}")
 
         # Initialize copy trading schema
         if COPY_TRACKER_AVAILABLE:
@@ -2560,44 +2607,63 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         # actions are surfaced via the signal_trade outbox above.
 
         # Whale / insider alerts (two flags: whale and insider).
-        try:
-            for a in db.get_recent_whale_insider_alerts(limit=limit * 2):
-                ts = int(a.get("executed_at") or 0)
-                kind = (a.get("kind") or "").strip().lower()
-                trade_usd = float(a.get("trade_usd") or 0)
-                market_title = (a.get("market_title") or "").strip()
-                market_ref = market_title if market_title else "this market"
-                amount_str = f"${trade_usd:,.0f}"
-                if kind == "whale":
-                    message = f"Whale alert: Someone just placed a position of {amount_str} on {market_ref}"
-                elif kind == "insider":
-                    message = f"Insider alert: Someone just placed a position of {amount_str} on {market_ref}"
-                else:
-                    message = f"Alert: Someone just placed a position of {amount_str} on {market_ref}"
-                notifications.append(
-                    {
-                        "source": "whale_insider",
-                        "executed_at": ts,
-                        "timestamp": datetime.utcfromtimestamp(ts).isoformat() + "Z" if ts else None,
-                        "kind": a.get("kind"),  # "whale" | "insider"
-                        "message": message,
-                        "wallet": a.get("wallet"),
-                        "trade_usd": trade_usd,
-                        "condition_id": a.get("condition_id"),
-                        "market_title": a.get("market_title"),
-                        "tx_hash": a.get("tx_hash"),
-                        "market_id": None,
-                        "side": None,
-                        "amount": trade_usd,
-                        "size": None,
-                        "price": None,
-                        "order_side": None,
-                        "status": a.get("kind"),
-                        "leader_address": a.get("wallet"),
-                    }
-                )
-        except Exception:
-            pass
+        # Only show if user has signal trading enabled (5m or 15m)
+        show_whale_insider = bool(user.get("signal_5m_enabled") or user.get("signal_15m_enabled"))
+        if show_whale_insider:
+            try:
+                for a in db.get_recent_whale_insider_alerts(limit=limit * 2):
+                    ts = int(a.get("executed_at") or 0)
+                    kind = (a.get("kind") or "").strip().lower()
+                    trade_usd = float(a.get("trade_usd") or 0)
+                    market_title = (a.get("market_title") or "").strip()
+                    market_ref = market_title if market_title else "this market"
+                    amount_str = f"${trade_usd:,.0f}"
+                    if kind == "whale":
+                        message = f"Whale alert: Someone just placed a position of {amount_str} on {market_ref}"
+                    elif kind == "insider":
+                        message = f"Insider alert: Someone just placed a position of {amount_str} on {market_ref}"
+                    else:
+                        message = f"Alert: Someone just placed a position of {amount_str} on {market_ref}"
+                    # Get side from database (may be "YES"/"NO" or "buy"/"sell" or similar)
+                    db_side = a.get("side")
+                    # Map side to order_side format
+                    order_side = None
+                    if db_side:
+                        side_lower = str(db_side).lower()
+                        if side_lower in ("yes", "buy", "long", "up"):
+                            order_side = "buy"
+                        elif side_lower in ("no", "sell", "short", "down"):
+                            order_side = "sell"
+                    # For whale/insider trades, size = trade_usd (we don't have separate size/price breakdown)
+                    # Set size to trade_usd and price to 1.0 as a reasonable default
+                    size = trade_usd
+                    price = 1.0
+                    notifications.append(
+                        {
+                            "source": "whale_insider",
+                            "executed_at": ts,
+                            "timestamp": datetime.utcfromtimestamp(ts).isoformat() + "Z" if ts else None,
+                            "kind": a.get("kind"),  # "whale" | "insider"
+                            "message": message,
+                            "wallet": a.get("wallet"),
+                            "trade_usd": trade_usd,
+                            "condition_id": a.get("condition_id"),
+                            "market_title": a.get("market_title"),
+                            "tx_hash": a.get("tx_hash"),
+                            "market_id": None,
+                            "side": db_side,
+                            "amount": trade_usd,
+                            "size": size,
+                            "price": price,
+                            "order_side": order_side,
+                            "status": a.get("kind"),
+                            "leader_address": a.get("wallet"),
+                        }
+                    )
+            except Exception:
+                pass
+
+        # Whale/insider alerts end (only shown if signal trading enabled)
 
         notifications.sort(key=lambda n: int(n.get("executed_at") or 0), reverse=True)
         notifications = notifications[:limit]
@@ -2622,15 +2688,22 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
 
         trading_wallet = get_trading_wallet_address(user.get("eth_address") or "")
         return {
-            "enabled": bool(user.get("signal_trading_enabled") or 0),
-            "amount_usd": float(user.get("signal_trade_amount_usd") or 0.0),
+            "5m": {
+                "enabled": bool(user.get("signal_5m_enabled") or 0),
+                "shares": int(user.get("signal_5m_amount_usd") or 5),
+            },
+            "15m": {
+                "enabled": bool(user.get("signal_15m_enabled") or 0),
+                "shares": int(user.get("signal_15m_amount_usd") or 5),
+            },
             "wallet": user.get("eth_address"),
             "trading_wallet": trading_wallet,
         }
 
     class SignalTradingSettingsRequest(BaseModel):
+        timeframe: str  # "5m" or "15m"
         enabled: bool | None = None
-        amount_usd: float | None = None
+        shares: int | None = None  # Number of shares (min 5)
 
     @app.post(
         "/me/signal-trading/settings",
@@ -2645,34 +2718,43 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         if not user:
             raise HTTPException(status_code=404, detail="User not found.")
 
+        timeframe = body.timeframe.lower() if body.timeframe else "5m"
+        if timeframe not in ("5m", "15m"):
+            raise HTTPException(status_code=400, detail="timeframe must be '5m' or '15m'.")
+
         enabled = body.enabled
-        amount = body.amount_usd
-        if amount is not None:
-            try:
-                amount = float(amount)
-            except Exception:
-                raise HTTPException(status_code=400, detail="amount_usd must be a number.")
-            if amount < 0:
-                raise HTTPException(status_code=400, detail="amount_usd must be >= 0.")
-            if amount > 1000:
-                raise HTTPException(status_code=400, detail="amount_usd too large.")
+        shares = body.shares
+        if shares is not None:
+            if shares < 5:
+                raise HTTPException(status_code=400, detail="Minimum 5 shares.")
+            if shares > 1000:
+                raise HTTPException(status_code=400, detail="Maximum 1000 shares.")
+
+        enabled_col = "signal_5m_enabled" if timeframe == "5m" else "signal_15m_enabled"
+        shares_col = "signal_5m_amount_usd" if timeframe == "5m" else "signal_15m_amount_usd"
 
         with db.transaction() as conn:
             if enabled is not None:
                 conn.execute(
-                    "UPDATE users SET signal_trading_enabled = ? WHERE user_id = ?;",
+                    f"UPDATE users SET {enabled_col} = ? WHERE user_id = ?;",
                     (1 if enabled else 0, user["user_id"]),
                 )
-            if amount is not None:
+            if shares is not None:
                 conn.execute(
-                    "UPDATE users SET signal_trade_amount_usd = ? WHERE user_id = ?;",
-                    (amount, user["user_id"]),
+                    f"UPDATE users SET {shares_col} = ? WHERE user_id = ?;",
+                    (shares, user["user_id"]),
                 )
 
         user2 = db.get_user(user["user_id"]) or {}
         return {
-            "enabled": bool(user2.get("signal_trading_enabled") or 0),
-            "amount_usd": float(user2.get("signal_trade_amount_usd") or 0.0),
+            "5m": {
+                "enabled": bool(user2.get("signal_5m_enabled") or 0),
+                "shares": int(user2.get("signal_5m_amount_usd") or 5),
+            },
+            "15m": {
+                "enabled": bool(user2.get("signal_15m_enabled") or 0),
+                "shares": int(user2.get("signal_15m_amount_usd") or 5),
+            },
         }
 
     @app.post(
@@ -2742,6 +2824,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
             dry_run=bool(dry_run),
             use_limit_orders=USE_LIMIT_ORDERS,
             limit_order_price=LIMIT_ORDER_PRICE,
+            send_notification=not dry_run,  # Only notify on real trades
         )
 
         traded, result = manager.process_signal(signal)

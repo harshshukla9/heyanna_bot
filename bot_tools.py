@@ -680,16 +680,55 @@ def _fetch_closed_positions(address: str) -> list[dict]:
         return []
 
 
+def _fetch_payout_info(condition_id: str) -> dict | None:
+    """Fetch payout information for a resolved condition from the Data API."""
+    try:
+        # Use the conditions endpoint to get payout info
+        url = f"https://data-api.polymarket.com/v1/conditions?conditionIds={condition_id}"
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list) and data:
+                return data[0]
+        return None
+    except Exception as e:
+        logging.error(f"Error fetching payout info for {condition_id}: {e}")
+        return None
+
+
+def _get_winning_indices(payout_info: dict) -> list[int]:
+    """
+    Extract winning outcome indices from payout info.
+    Returns 1-indexed indices as required by redeemPositions.
+
+    Payout vector example:
+    - [1, 0] means outcome 0 (index 1) won
+    - [0, 1] means outcome 1 (index 2) won
+    """
+    payout = payout_info.get("payouts") or payout_info.get("payout") or []
+    if not payout or not isinstance(payout, list):
+        return []
+
+    winning = []
+    for i, amount in enumerate(payout):
+        if amount > 0:
+            # Convert to 1-indexed as required by CTF
+            winning.append(i + 1)
+
+    return winning
+
+
 @mcp.tool()
 def claim_polymarket_winnings(address: str) -> str:
     """
     Attempt to redeem winnings from resolved Polymarket markets using the
-    gasless Builder relayer. This implementation is intentionally conservative:
-    - It looks at closed positions from the Data API.
-    - For each unique conditionId, it calls redeemPositions with
-      parentCollectionId = 0x0 and indexSets = [1, 2] (suitable for simple
-      binary markets).
-    More complex composed/neg-risk structures may require additional handling.
+    gasless Builder relayer.
+
+    Flow:
+    1. Fetch closed positions for the user's trading wallet
+    2. For each unique conditionId, fetch payout info to determine winner
+    3. Only redeem the winning outcome index (not both)
+    4. Submit via gasless relay to Safe wallet
     """
     db_user = db.get_user_by_address(address)
     if not db_user:
@@ -701,29 +740,49 @@ def claim_polymarket_winnings(address: str) -> str:
         return "Gasless relay is not configured on this server."
 
     closed = _fetch_closed_positions(address)
-    condition_ids: set[str] = set()
+    if not closed:
+        return "No unclaimed winnings."
+
+    # Group positions by conditionId and track which ones have winnings
+    condition_payouts: dict[str, dict] = {}
     for p in closed:
         cid = p.get("conditionId") or p.get("condition_id") or ""
         if cid:
-            condition_ids.add(cid)
+            condition_payouts[cid] = p
 
-    if not condition_ids:
+    if not condition_payouts:
         return "No unclaimed winnings."
 
     w3 = Web3()
     ctf = w3.eth.contract(address=Web3.to_checksum_address(CTF_ADDRESS), abi=CTF_REDEEM_ABI)
 
     txs: list[_RelayTx] = []
-    for cid in sorted(condition_ids):
+    claimed_count = 0
+
+    for cid, pos_info in condition_payouts.items():
         try:
+            # Fetch payout info to determine winning outcome
+            payout_info = _fetch_payout_info(cid)
+            if not payout_info:
+                logging.warning(f"Could not fetch payout info for condition {cid}")
+                continue
+
+            # Get winning indices (1-indexed)
+            winning_indices = _get_winning_indices(payout_info)
+            if not winning_indices:
+                logging.warning(f"No winning outcomes found for condition {cid}")
+                continue
+
             # Ensure bytes32 formatting
             condition_bytes = bytes.fromhex(cid[2:]) if cid.startswith("0x") else bytes.fromhex(cid)
             if len(condition_bytes) != 32:
                 logging.warning(f"Skipping conditionId with invalid length: {cid}")
                 continue
+
+            # Build redeem call with only winning outcomes
             redeem_data = ctf.encode_abi(
                 "redeemPositions",
-                args=[USDC_POLYGON, ZERO_COLLECTION_ID, cid, [1, 2]],
+                args=[USDC_POLYGON, ZERO_COLLECTION_ID, cid, winning_indices],
             )
             txs.append(
                 _RelayTx(
@@ -732,6 +791,9 @@ def claim_polymarket_winnings(address: str) -> str:
                     value="0",
                 )
             )
+            claimed_count += 1
+            logging.info(f"Queued redemption for condition {cid[:16]}... winning indices: {winning_indices}")
+
         except Exception as e:
             logging.error(f"Failed to build redeem tx for condition {cid}: {e}")
             continue
@@ -746,7 +808,6 @@ def claim_polymarket_winnings(address: str) -> str:
         result = resp.wait()
 
         if not isinstance(result, dict):
-            # Some SDK versions return None or a non-dict on failure.
             tx_hash = getattr(resp, "transaction_hash", "") or getattr(
                 resp, "tx_hash", ""
             )
@@ -755,8 +816,6 @@ def claim_polymarket_winnings(address: str) -> str:
                 result,
                 tx_hash,
             )
-            # In practice this often means there were no claimable payouts for the
-            # selected closed positions at this moment.
             return "No unclaimed winnings."
 
         tx_hash = result.get("txHash") or result.get("transactionHash") or ""
@@ -770,7 +829,7 @@ def claim_polymarket_winnings(address: str) -> str:
             )
 
         return (
-            "✅ Submitted gasless claim transactions via Polymarket relayer.\n"
+            f"✅ Submitted gasless claim for {claimed_count} position(s) via Polymarket relayer.\n"
             f"Transaction: {tx_hash or '[pending]'}"
         )
     except Exception as e:

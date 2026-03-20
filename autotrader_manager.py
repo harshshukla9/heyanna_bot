@@ -16,6 +16,9 @@ from __future__ import annotations
 import json
 import time
 import logging
+import os
+import urllib.request
+import urllib.error
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -90,6 +93,7 @@ class AutoTraderManager:
         dry_run: bool = False,
         use_limit_orders: bool = USE_LIMIT_ORDERS,
         limit_order_price: float = LIMIT_ORDER_PRICE,
+        send_notification: bool = True,
     ):
         self.db = db
         self.user_id = user_id
@@ -97,6 +101,10 @@ class AutoTraderManager:
         self.dry_run = dry_run
         self.use_limit_orders = use_limit_orders
         self.limit_order_price = limit_order_price
+        self.send_notification = send_notification
+
+        # Telegram bot token for notifications
+        self.bot_token = os.getenv("BOT_TOKEN")
 
         # Track recent signals to avoid duplicates
         self.recent_signals: deque[str] = deque(maxlen=RECENT_SIGNALS_MAX)
@@ -134,6 +142,69 @@ class AutoTraderManager:
         fh.setLevel(logging.INFO)
         fh.setFormatter(logging.Formatter('%(message)s'))
         self.order_logger.addHandler(fh)
+
+    def _send_telegram_notification(self, chat_id: int, message: str) -> None:
+        """Send a Telegram notification to the user."""
+        if not self.send_notification or not self.bot_token:
+            return
+
+        try:
+            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+            data = json.dumps({
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "Markdown"
+            }).encode('utf-8')
+
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={'Content-Type': 'application/json'},
+                method='POST'
+            )
+
+            with urllib.request.urlopen(req, timeout=10) as response:
+                logger.debug(f"[autotrader:{self.user_id}] Notification sent to chat_id {chat_id}")
+        except urllib.error.URLError as e:
+            logger.warning(f"[autotrader:{self.user_id}] Failed to send Telegram notification: {e}")
+        except Exception as e:
+            logger.warning(f"[autotrader:{self.user_id}] Unexpected error sending notification: {e}")
+
+    def _send_signal_trade_notification(
+        self,
+        condition_id: str,
+        signal_side: str,
+        mapped_side: str,
+        shares: float = None,
+        amount: float = None,
+        price: float = None,
+        timeframe: str = None,
+    ) -> None:
+        """Send a Telegram notification about a signal trade execution."""
+        if not self.send_notification or not self.bot_token:
+            return
+
+        # user_id is the Telegram user ID which can be used as chat_id
+        chat_id = self.user_id
+
+        # Build notification message
+        timeframe_str = f" ({timeframe.upper()})" if timeframe else ""
+        order_type_str = f" @ ${price:.2f}/share" if price else ""
+        size_str = f"{shares} shares" if shares else f"${amount:.2f}"
+
+        if price:
+            total_value = shares * price
+            size_str = f"{shares} shares ({total_value:.2f} USD)"
+
+        message = (
+            f"📡 *Signal Trade Executed*{timeframe_str}\n\n"
+            f"Direction: *{signal_side}*\n"
+            f"Market: *{condition_id[:40]}...*\n"
+            f"Size: *{size_str}*{order_type_str}\n\n"
+            f"Trade placed successfully ✅"
+        )
+
+        self._send_telegram_notification(chat_id, message)
 
     def _load_traded_condition_ids(self) -> None:
         """Load traded condition_ids from DB to prevent re-trading after restart."""
@@ -304,6 +375,18 @@ class AutoTraderManager:
                 order_log["result"] = result
                 order_log["status"] = "success" if "✅" in result else "failed"
                 self.order_logger.info(json.dumps(order_log))
+
+                # Send Telegram notification on success
+                if "✅" in result:
+                    self._send_signal_trade_notification(
+                        condition_id=condition_id,
+                        signal_side=side,
+                        mapped_side=mapped_side,
+                        shares=shares,
+                        price=self.limit_order_price,
+                        timeframe=signal_info.get("timeframe"),
+                    )
+
                 return result
             else:
                 order_log["order_type"] = "market"
@@ -323,6 +406,17 @@ class AutoTraderManager:
                 order_log["result"] = result
                 order_log["status"] = "success" if "✅" in result else "failed"
                 self.order_logger.info(json.dumps(order_log))
+
+                # Send Telegram notification on success
+                if "✅" in result:
+                    self._send_signal_trade_notification(
+                        condition_id=condition_id,
+                        signal_side=side,
+                        mapped_side=mapped_side,
+                        amount=self.trade_amount_usd,
+                        timeframe=signal_info.get("timeframe"),
+                    )
+
                 return result
         except Exception as e:
             order_log["error"] = str(e)
@@ -339,6 +433,14 @@ class AutoTraderManager:
         message_key = self._message_key(signal)
         if not message_key:
             return False, "No message key"
+
+        # Safety: only execute trades for live signals.
+        # Listener stores historical backfill as parsed signals in the same JSONL,
+        # but we never want to execute those.
+        src = str(signal.get("source") or "")
+        if src and not src.startswith("live:"):
+            self.recent_signals.append(message_key)
+            return False, "Skip non-live signal"
 
         # Check if already processed
         if self._is_signal_recent(message_key):
