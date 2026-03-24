@@ -1398,9 +1398,46 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
 
     @app.on_event("startup")
     async def _start_background_tasks():
+        # In-memory throttling for auto-claim attempts and notifications.
+        _last_auto_claim_ts: dict[int, int] = {}
+        _last_auto_claim_status: dict[int, str] = {}
+
+        # Ensure notification outbox tables exist (consumed by /me/copy-trading/notifications
+        # and bot broadcast loop).
+        try:
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS signal_notifications_outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    sent_at INTEGER
+                );
+                """
+            )
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "[autotrader] Failed to ensure signal_notifications_outbox table: %s",
+                e,
+            )
+
         async def _enqueue_outbox(user_id: int, kind: str, text: str) -> None:
-            # Notifications sent via bot, no outbox table needed
-            pass
+            try:
+                now_ts = int(time.time())
+                db.execute(
+                    """
+                    INSERT INTO signal_notifications_outbox (user_id, kind, text, created_at, sent_at)
+                    VALUES (?, ?, ?, ?, NULL);
+                    """,
+                    (int(user_id), str(kind), str(text), now_ts),
+                )
+            except Exception as e:
+                logging.getLogger(__name__).warning(
+                    "[autotrader] Failed to enqueue outbox notification: %s",
+                    e,
+                )
 
         def _trade_for_user(db, uid, amount_usd, signal_dict, use_limit_orders, limit_order_price):
             """Helper function to process a trade for a single user (for threading)."""
@@ -1509,6 +1546,129 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
             except Exception as e:
                 logging.getLogger(__name__).error(f"[autotrader] Error: {e}")
 
+        async def _auto_claim_winnings_loop() -> None:
+            """
+            Rust-style auto-claim behavior:
+            - Periodically scan users with signal-traded condition IDs.
+            - Attempt gasless redemption via existing bot_tools helper.
+            - Retry on later ticks when nothing claimable yet / transient failures.
+            """
+            interval_sec = max(
+                30.0,
+                float(os.getenv("AUTO_CLAIM_INTERVAL_SEC", "120") or "120"),
+            )
+            cooldown_sec = max(
+                60,
+                int(os.getenv("AUTO_CLAIM_USER_COOLDOWN_SEC", "300") or "300"),
+            )
+            verbose_user_logs = os.getenv("AUTO_CLAIM_VERBOSE_USER_LOGS", "").strip().lower() in ("1", "true", "yes")
+
+            def _mask_wallet(addr: str) -> str:
+                a = (addr or "").strip()
+                if len(a) < 12:
+                    return a
+                return f"{a[:8]}...{a[-6:]}"
+
+            while True:
+                tick_start = time.time()
+                try:
+                    rows = db.execute(
+                        """
+                        SELECT DISTINCT u.user_id, u.eth_address
+                        FROM traded_condition_ids t
+                        JOIN users u ON u.user_id = t.user_id
+                        WHERE COALESCE(u.eth_address, '') != '';
+                        """
+                    ).fetchall()
+
+                    now_ts = int(time.time())
+                    scanned = len(rows)
+                    attempted = 0
+                    throttled = 0
+                    submitted = 0
+                    no_unclaimed = 0
+                    failed = 0
+                    for r in rows:
+                        uid = int(r["user_id"])
+                        addr = (r["eth_address"] or "").strip()
+                        if not addr:
+                            continue
+
+                        last_ts = _last_auto_claim_ts.get(uid, 0)
+                        if now_ts - last_ts < cooldown_sec:
+                            throttled += 1
+                            continue
+                        _last_auto_claim_ts[uid] = now_ts
+                        attempted += 1
+
+                        result_text = await asyncio.to_thread(
+                            bot_tools.claim_polymarket_winnings,
+                            addr,
+                        )
+                        result_norm = str(result_text or "").strip()
+                        result_lower = result_norm.lower()
+
+                        if "submitted gasless claim" in result_lower:
+                            submitted += 1
+                            key = f"success:{result_norm}"
+                            if _last_auto_claim_status.get(uid) != key:
+                                _last_auto_claim_status[uid] = key
+                                await _enqueue_outbox(
+                                    uid,
+                                    "signal_winnings_claim_submitted",
+                                    result_norm,
+                                )
+                            logging.getLogger(__name__).info(
+                                "[autotrader] Auto-claim submitted user=%s wallet=%s",
+                                uid,
+                                _mask_wallet(addr),
+                            )
+                        elif "no unclaimed winnings" in result_lower:
+                            # Normal state after successful redemption or before settlement.
+                            no_unclaimed += 1
+                            if verbose_user_logs:
+                                logging.getLogger(__name__).info(
+                                    "[autotrader] Auto-claim no-unclaimed user=%s wallet=%s",
+                                    uid,
+                                    _mask_wallet(addr),
+                                )
+                        elif result_norm:
+                            failed += 1
+                            key = f"error:{result_norm}"
+                            if _last_auto_claim_status.get(uid) != key:
+                                _last_auto_claim_status[uid] = key
+                                await _enqueue_outbox(
+                                    uid,
+                                    "signal_winnings_claim_failed",
+                                    result_norm,
+                                )
+                            logging.getLogger(__name__).warning(
+                                "[autotrader] Auto-claim failed for user=%s wallet=%s: %s",
+                                uid,
+                                _mask_wallet(addr),
+                                result_norm,
+                            )
+                    elapsed_ms = int((time.time() - tick_start) * 1000)
+                    logging.getLogger(__name__).info(
+                        "[autotrader] Auto-claim tick scanned=%s attempted=%s submitted=%s no_unclaimed=%s failed=%s throttled=%s elapsed_ms=%s",
+                        scanned,
+                        attempted,
+                        submitted,
+                        no_unclaimed,
+                        failed,
+                        throttled,
+                        elapsed_ms,
+                    )
+                except Exception as e:
+                    elapsed_ms = int((time.time() - tick_start) * 1000)
+                    logging.getLogger(__name__).warning(
+                        "[autotrader] Auto-claim loop error after %sms: %s",
+                        elapsed_ms,
+                        e,
+                    )
+
+                await asyncio.sleep(interval_sec)
+
         # Initialize copy trading schema
         if COPY_TRACKER_AVAILABLE:
             try:
@@ -1527,6 +1687,13 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         else:
             logging.getLogger(__name__).info("[COPY TRADING] Using polling mode")
             asyncio.create_task(_global_copy_trading_loop_polling())
+
+        if os.getenv("DISABLE_AUTO_CLAIM_WINNINGS", "").strip().lower() not in ("1", "true", "yes"):
+            logging.getLogger(__name__).info(
+                "[autotrader] Auto-claim winnings loop enabled (interval=%ss)",
+                os.getenv("AUTO_CLAIM_INTERVAL_SEC", "120"),
+            )
+            asyncio.create_task(_auto_claim_winnings_loop())
 
         # API's own daemon: run Telegram announcement signal listener in-process for latest and time-accurate notifications.
         # Enabled when ENABLE_TELEGRAM_SIGNAL_LISTENER=1 or when TELEGRAM_SIGNAL_CHAT + API_ID + API_HASH are set.

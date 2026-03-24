@@ -680,19 +680,57 @@ def _fetch_closed_positions(address: str) -> list[dict]:
         return []
 
 
-def _fetch_payout_info(condition_id: str) -> dict | None:
-    """Fetch payout information for a resolved condition from the Data API."""
+def _fetch_redeemable_positions(address: str) -> list[dict]:
+    """Fetch redeemable positions for a wallet via Data API."""
+    trading_addr = _get_trading_wallet_address(address)
     try:
-        # Use the conditions endpoint to get payout info
-        url = f"https://data-api.polymarket.com/v1/conditions?conditionIds={condition_id}"
+        url = f"https://data-api.polymarket.com/positions?user={trading_addr}&redeemable=true"
         resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
+        data = resp.json() if resp.status_code == 200 else []
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        logging.debug(f"Error fetching redeemable positions for {address}: {e}")
+        return []
+
+
+def _fetch_payout_info(condition_id: str) -> dict | None:
+    """Fetch payout information for a resolved condition from Data/Gamma APIs."""
+    cid = (condition_id or "").strip()
+    if not cid:
+        return None
+
+    if not cid.startswith("0x"):
+        cid = "0x" + cid
+
+    # Try multiple known endpoints because Polymarket API shapes vary over time.
+    candidates = (
+        f"https://data-api.polymarket.com/v1/conditions?conditionIds={cid}",
+        f"https://data-api.polymarket.com/conditions?conditionIds={cid}",
+        f"https://gamma-api.polymarket.com/markets?condition_ids={cid}&limit=1",
+        f"https://gamma-api.polymarket.com/markets?conditionId={cid}&limit=1",
+    )
+
+    try:
+        for url in candidates:
+            resp = requests.get(url, timeout=8)
+            if resp.status_code != 200:
+                continue
             data = resp.json()
-            if isinstance(data, list) and data:
-                return data[0]
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                item = data[0]
+                # Normalize Gamma market winner fields into payout-like shape.
+                if "payouts" not in item and "tokens" in item:
+                    tokens = item.get("tokens") or []
+                    payouts = []
+                    if isinstance(tokens, list) and tokens:
+                        for t in tokens:
+                            payouts.append(1 if isinstance(t, dict) and bool(t.get("winner")) else 0)
+                    if payouts:
+                        item = {**item, "payouts": payouts}
+                return item
         return None
     except Exception as e:
-        logging.error(f"Error fetching payout info for {condition_id}: {e}")
+        logging.debug(f"Error fetching payout info for {cid}: {e}")
         return None
 
 
@@ -739,13 +777,14 @@ def claim_polymarket_winnings(address: str) -> str:
     if client is None:
         return "Gasless relay is not configured on this server."
 
-    closed = _fetch_closed_positions(address)
-    if not closed:
+    redeemable = _fetch_redeemable_positions(address)
+    source_positions = redeemable if redeemable else _fetch_closed_positions(address)
+    if not source_positions:
         return "No unclaimed winnings."
 
     # Group positions by conditionId and track which ones have winnings
     condition_payouts: dict[str, dict] = {}
-    for p in closed:
+    for p in source_positions:
         cid = p.get("conditionId") or p.get("condition_id") or ""
         if cid:
             condition_payouts[cid] = p
@@ -758,19 +797,20 @@ def claim_polymarket_winnings(address: str) -> str:
 
     txs: list[_RelayTx] = []
     claimed_count = 0
+    skipped_no_payout = 0
 
     for cid, pos_info in condition_payouts.items():
         try:
             # Fetch payout info to determine winning outcome
             payout_info = _fetch_payout_info(cid)
             if not payout_info:
-                logging.warning(f"Could not fetch payout info for condition {cid}")
+                skipped_no_payout += 1
                 continue
 
             # Get winning indices (1-indexed)
             winning_indices = _get_winning_indices(payout_info)
             if not winning_indices:
-                logging.warning(f"No winning outcomes found for condition {cid}")
+                skipped_no_payout += 1
                 continue
 
             # Ensure bytes32 formatting
@@ -797,6 +837,12 @@ def claim_polymarket_winnings(address: str) -> str:
         except Exception as e:
             logging.error(f"Failed to build redeem tx for condition {cid}: {e}")
             continue
+
+    if skipped_no_payout:
+        logging.info(
+            "Claim scan skipped %s condition(s) without payout/winner info",
+            skipped_no_payout,
+        )
 
     if not txs:
         return "No unclaimed winnings."
