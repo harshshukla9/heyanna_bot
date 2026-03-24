@@ -9,8 +9,9 @@ import re
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Mapping
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, quote, urlencode
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import jwt
@@ -1270,6 +1271,143 @@ def _verify_telegram_login_widget(params: Mapping[str, str], bot_token: str) -> 
     return user_obj
 
 
+def _logs_base_dir() -> Path:
+    """Directory for auto-claim / PnL card file logs (default ./logs)."""
+    raw = (os.getenv("LOGS_DIR") or "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return (Path(__file__).resolve().parent / "logs").resolve()
+
+
+def _append_logs_text(filename: str, message: str, level: str = "INFO") -> None:
+    """Append one human-readable line: UTC ISO | LEVEL | message"""
+    try:
+        d = _logs_base_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        ts = datetime.utcnow().isoformat() + "Z"
+        with open(d / filename, "a", encoding="utf-8") as f:
+            f.write(f"{ts} | {level} | {message}\n")
+    except Exception as e:
+        logging.getLogger(__name__).debug("Failed to write %s: %s", filename, e)
+
+
+def _append_logs_jsonl(filename: str, event: Dict[str, Any]) -> None:
+    """Append one JSON object per line (structured ops logs)."""
+    try:
+        d = _logs_base_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        row = {
+            **event,
+            "ts_unix": int(time.time()),
+            "ts_iso": datetime.utcnow().isoformat() + "Z",
+        }
+        with open(d / filename, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logging.getLogger(__name__).debug("Failed to write jsonl %s: %s", filename, e)
+
+
+def _build_pnl_card_image_url(
+    payload: Dict[str, Any],
+    *,
+    user_id: int | None = None,
+    wallet_masked: str | None = None,
+) -> str | None:
+    """
+    Build HTTP URL for a PnL card image shown in Telegram.
+    Optional env:
+      PNL_SHARE_ORIGIN — base site (default https://beta.heyanna.trade)
+      PNL_CARD_IMAGE_URL_TEMPLATE — e.g. "{origin}/api/og/pnl?title={title}&pnl_cash={pnl_cash}&pnl_percent={pnl_percent}&outcome={outcome}"
+
+    Writes structured lines to logs/pnl_card.log and logs/pnl_card.jsonl (or LOGS_DIR).
+    """
+    origin = ""
+    title = ""
+    outcome = ""
+    pnl_cash = 0.0
+    pct_str = ""
+    card_mode: str | None = None
+    url: str | None = None
+    err_msg: str | None = None
+
+    try:
+        origin = (os.getenv("PNL_SHARE_ORIGIN") or "https://beta.heyanna.trade").strip().rstrip("/")
+        title = str(payload.get("title") or "Polymarket claim")
+        outcome = str(payload.get("outcome") or "")
+        pnl_cash = float(payload.get("pnl_cash") or 0.0)
+        pnl_pct = payload.get("pnl_percent")
+        pct_str = f"{float(pnl_pct):.2f}" if pnl_pct is not None else ""
+
+        tpl = (os.getenv("PNL_CARD_IMAGE_URL_TEMPLATE") or "").strip()
+        if tpl:
+            card_mode = "template"
+            url = tpl.format(
+                origin=origin,
+                title=quote(title[:200], safe=""),
+                outcome=quote(outcome[:120], safe=""),
+                pnl_cash=f"{pnl_cash:.2f}",
+                pnl_percent=pct_str,
+            )
+        else:
+            card_mode = "default_query"
+            qs = urlencode(
+                {
+                    "title": title[:120],
+                    "outcome": outcome[:80],
+                    "pnl_cash": f"{pnl_cash:.2f}",
+                    "pnl_percent": pct_str or "0",
+                }
+            )
+            url = f"{origin}/share/pnl-card.png?{qs}"
+
+        _append_logs_text(
+            "pnl_card.log",
+            f"card_generated mode={card_mode} user_id={user_id} wallet={wallet_masked or '-'} "
+            f"pnl_cash={pnl_cash:.2f} pnl_pct={pct_str or '-'} url_chars={len(url)}",
+        )
+        _append_logs_jsonl(
+            "pnl_card.jsonl",
+            {
+                "event": "pnl_card_generated",
+                "mode": card_mode,
+                "user_id": user_id,
+                "wallet_masked": wallet_masked,
+                "origin": origin,
+                "payload": {
+                    "title": title[:200],
+                    "outcome": outcome[:120],
+                    "pnl_cash": pnl_cash,
+                    "pnl_percent": pnl_pct if pnl_pct is not None else None,
+                    "position_count": payload.get("position_count"),
+                },
+                "url": url,
+            },
+        )
+        return url
+    except Exception as e:
+        err_msg = str(e)
+        _append_logs_text(
+            "pnl_card.log",
+            f"card_failed user_id={user_id} wallet={wallet_masked or '-'} error={err_msg}",
+            level="ERROR",
+        )
+        _append_logs_jsonl(
+            "pnl_card.jsonl",
+            {
+                "event": "pnl_card_failed",
+                "user_id": user_id,
+                "wallet_masked": wallet_masked,
+                "error": err_msg,
+                "payload": {
+                    "title": str(payload.get("title") or "")[:200],
+                    "outcome": str(payload.get("outcome") or "")[:120],
+                    "pnl_cash": payload.get("pnl_cash"),
+                },
+            },
+        )
+        return None
+
+
 def create_api_app(db: DatabaseManager) -> FastAPI:
     """
     Build and return the FastAPI application.
@@ -1398,8 +1536,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
 
     @app.on_event("startup")
     async def _start_background_tasks():
-        # In-memory throttling for auto-claim attempts and notifications.
-        _last_auto_claim_ts: dict[int, int] = {}
+        # De-dupe identical auto-claim notification payloads per user (not time-based).
         _last_auto_claim_status: dict[int, str] = {}
 
         # Ensure notification outbox tables exist (consumed by /me/copy-trading/notifications
@@ -1548,18 +1685,15 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
 
         async def _auto_claim_winnings_loop() -> None:
             """
-            Rust-style auto-claim behavior:
-            - Periodically scan users with signal-traded condition IDs.
-            - Attempt gasless redemption via existing bot_tools helper.
-            - Retry on later ticks when nothing claimable yet / transient failures.
+            Auto-claim on a fixed cadence (default 10 minutes = cron-like):
+            - All users with a Polygon wallet are scanned each tick.
+            - Gasless redemption via bot_tools.claim_polymarket_winnings.
+            - On successful submit, enqueue Telegram notification with PnL card image URL.
             """
+            # Default 600s (10 minutes); override with AUTO_CLAIM_INTERVAL_SEC if needed.
             interval_sec = max(
-                30.0,
-                float(os.getenv("AUTO_CLAIM_INTERVAL_SEC", "120") or "120"),
-            )
-            cooldown_sec = max(
-                60,
-                int(os.getenv("AUTO_CLAIM_USER_COOLDOWN_SEC", "300") or "300"),
+                60.0,
+                float(os.getenv("AUTO_CLAIM_INTERVAL_SEC", "600") or "600"),
             )
             verbose_user_logs = os.getenv("AUTO_CLAIM_VERBOSE_USER_LOGS", "").strip().lower() in ("1", "true", "yes")
 
@@ -1574,19 +1708,17 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                 try:
                     rows = db.execute(
                         """
-                        SELECT DISTINCT u.user_id, u.eth_address
-                        FROM traded_condition_ids t
-                        JOIN users u ON u.user_id = t.user_id
-                        WHERE COALESCE(u.eth_address, '') != '';
+                        SELECT user_id, eth_address
+                        FROM users
+                        WHERE COALESCE(eth_address, '') != '';
                         """
                     ).fetchall()
 
-                    now_ts = int(time.time())
                     scanned = len(rows)
                     attempted = 0
-                    throttled = 0
                     submitted = 0
                     no_unclaimed = 0
+                    payout_unresolved = 0
                     failed = 0
                     for r in rows:
                         uid = int(r["user_id"])
@@ -1594,13 +1726,12 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                         if not addr:
                             continue
 
-                        last_ts = _last_auto_claim_ts.get(uid, 0)
-                        if now_ts - last_ts < cooldown_sec:
-                            throttled += 1
-                            continue
-                        _last_auto_claim_ts[uid] = now_ts
                         attempted += 1
 
+                        stats = await asyncio.to_thread(
+                            bot_tools.summarize_redeemable_positions_for_pnl_card,
+                            addr,
+                        )
                         result_text = await asyncio.to_thread(
                             bot_tools.claim_polymarket_winnings,
                             addr,
@@ -1610,18 +1741,84 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
 
                         if "submitted gasless claim" in result_lower:
                             submitted += 1
+                            payload = stats or {
+                                "title": "Winnings claimed",
+                                "outcome": "Redeemed",
+                                "pnl_cash": 0.0,
+                                "pnl_percent": None,
+                            }
                             key = f"success:{result_norm}"
+                            outbox_enqueued = False
+                            card_url: str | None = None
                             if _last_auto_claim_status.get(uid) != key:
                                 _last_auto_claim_status[uid] = key
+                                card_url = _build_pnl_card_image_url(
+                                    payload,
+                                    user_id=uid,
+                                    wallet_masked=_mask_wallet(addr),
+                                )
+                                msg_body = (
+                                    "🏆 Auto-claim submitted\n"
+                                    f"Est. PnL: ${float(payload.get('pnl_cash') or 0):+.2f}"
+                                    + (
+                                        f" ({float(payload.get('pnl_percent')):+.2f}%)"
+                                        if payload.get("pnl_percent") is not None
+                                        else ""
+                                    )
+                                    + "\n"
+                                    + result_norm
+                                )
+                                if card_url:
+                                    out_text = f"CARD_URL:{card_url}\n{msg_body}"
+                                else:
+                                    out_text = msg_body
                                 await _enqueue_outbox(
                                     uid,
                                     "signal_winnings_claim_submitted",
-                                    result_norm,
+                                    out_text,
                                 )
+                                outbox_enqueued = True
+                            _append_logs_text(
+                                "auto_claim.log",
+                                f"submit user_id={uid} wallet={_mask_wallet(addr)} "
+                                f"est_pnl={float(payload.get('pnl_cash') or 0):.2f} "
+                                f"outbox={'yes' if outbox_enqueued else 'deduped'} "
+                                f"card_url={'yes' if card_url else 'no'}",
+                            )
+                            _append_logs_jsonl(
+                                "auto_claim.jsonl",
+                                {
+                                    "event": "claim_submitted",
+                                    "user_id": uid,
+                                    "wallet_masked": _mask_wallet(addr),
+                                    "result_excerpt": result_norm[:500],
+                                    "est_pnl_cash": float(payload.get("pnl_cash") or 0),
+                                    "est_pnl_percent": payload.get("pnl_percent"),
+                                    "outbox_enqueued": outbox_enqueued,
+                                    "card_url_present": bool(card_url),
+                                },
+                            )
                             logging.getLogger(__name__).info(
                                 "[autotrader] Auto-claim submitted user=%s wallet=%s",
                                 uid,
                                 _mask_wallet(addr),
+                            )
+                        elif bot_tools.AUTOCLAIM_PAYOUT_UNRESOLVED_MARK.lower() in result_lower:
+                            # Resolved positions in Data API but Gamma/payout did not expose winner yet.
+                            payout_unresolved += 1
+                            logging.getLogger(__name__).info(
+                                "[autotrader] Auto-claim payout-unresolved user=%s wallet=%s",
+                                uid,
+                                _mask_wallet(addr),
+                            )
+                            _append_logs_jsonl(
+                                "auto_claim.jsonl",
+                                {
+                                    "event": "claim_payout_unresolved",
+                                    "user_id": uid,
+                                    "wallet_masked": _mask_wallet(addr),
+                                    "detail": result_norm[:2000],
+                                },
                             )
                         elif "no unclaimed winnings" in result_lower:
                             # Normal state after successful redemption or before settlement.
@@ -1632,9 +1829,22 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                                     uid,
                                     _mask_wallet(addr),
                                 )
+                                _append_logs_text(
+                                    "auto_claim.log",
+                                    f"no_unclaimed user_id={uid} wallet={_mask_wallet(addr)}",
+                                )
+                                _append_logs_jsonl(
+                                    "auto_claim.jsonl",
+                                    {
+                                        "event": "claim_no_unclaimed",
+                                        "user_id": uid,
+                                        "wallet_masked": _mask_wallet(addr),
+                                    },
+                                )
                         elif result_norm:
                             failed += 1
                             key = f"error:{result_norm}"
+                            outbox_fail = False
                             if _last_auto_claim_status.get(uid) != key:
                                 _last_auto_claim_status[uid] = key
                                 await _enqueue_outbox(
@@ -1642,6 +1852,24 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                                     "signal_winnings_claim_failed",
                                     result_norm,
                                 )
+                                outbox_fail = True
+                            _append_logs_text(
+                                "auto_claim.log",
+                                f"failed user_id={uid} wallet={_mask_wallet(addr)} "
+                                f"outbox={'yes' if outbox_fail else 'deduped'} "
+                                f"detail={result_norm[:300]}",
+                                level="WARN",
+                            )
+                            _append_logs_jsonl(
+                                "auto_claim.jsonl",
+                                {
+                                    "event": "claim_failed",
+                                    "user_id": uid,
+                                    "wallet_masked": _mask_wallet(addr),
+                                    "outbox_enqueued": outbox_fail,
+                                    "detail": result_norm[:2000],
+                                },
+                            )
                             logging.getLogger(__name__).warning(
                                 "[autotrader] Auto-claim failed for user=%s wallet=%s: %s",
                                 uid,
@@ -1650,14 +1878,35 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                             )
                     elapsed_ms = int((time.time() - tick_start) * 1000)
                     logging.getLogger(__name__).info(
-                        "[autotrader] Auto-claim tick scanned=%s attempted=%s submitted=%s no_unclaimed=%s failed=%s throttled=%s elapsed_ms=%s",
+                        "[autotrader] Auto-claim tick scanned=%s attempted=%s submitted=%s "
+                        "no_unclaimed=%s payout_unresolved=%s failed=%s elapsed_ms=%s",
                         scanned,
                         attempted,
                         submitted,
                         no_unclaimed,
+                        payout_unresolved,
                         failed,
-                        throttled,
                         elapsed_ms,
+                    )
+                    _append_logs_text(
+                        "auto_claim.log",
+                        f"tick scanned={scanned} attempted={attempted} submitted={submitted} "
+                        f"no_unclaimed={no_unclaimed} payout_unresolved={payout_unresolved} "
+                        f"failed={failed} elapsed_ms={elapsed_ms}",
+                    )
+                    _append_logs_jsonl(
+                        "auto_claim.jsonl",
+                        {
+                            "event": "tick",
+                            "scanned": scanned,
+                            "attempted": attempted,
+                            "submitted": submitted,
+                            "no_unclaimed": no_unclaimed,
+                            "payout_unresolved": payout_unresolved,
+                            "failed": failed,
+                            "elapsed_ms": elapsed_ms,
+                            "interval_sec": interval_sec,
+                        },
                     )
                 except Exception as e:
                     elapsed_ms = int((time.time() - tick_start) * 1000)
@@ -1665,6 +1914,19 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                         "[autotrader] Auto-claim loop error after %sms: %s",
                         elapsed_ms,
                         e,
+                    )
+                    _append_logs_text(
+                        "auto_claim.log",
+                        f"loop_error elapsed_ms={elapsed_ms} error={str(e)[:500]}",
+                        level="ERROR",
+                    )
+                    _append_logs_jsonl(
+                        "auto_claim.jsonl",
+                        {
+                            "event": "loop_error",
+                            "elapsed_ms": elapsed_ms,
+                            "error": str(e)[:2000],
+                        },
                     )
 
                 await asyncio.sleep(interval_sec)
@@ -1687,13 +1949,6 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         else:
             logging.getLogger(__name__).info("[COPY TRADING] Using polling mode")
             asyncio.create_task(_global_copy_trading_loop_polling())
-
-        if os.getenv("DISABLE_AUTO_CLAIM_WINNINGS", "").strip().lower() not in ("1", "true", "yes"):
-            logging.getLogger(__name__).info(
-                "[autotrader] Auto-claim winnings loop enabled (interval=%ss)",
-                os.getenv("AUTO_CLAIM_INTERVAL_SEC", "120"),
-            )
-            asyncio.create_task(_auto_claim_winnings_loop())
 
         # API's own daemon: run Telegram announcement signal listener in-process for latest and time-accurate notifications.
         # Enabled when ENABLE_TELEGRAM_SIGNAL_LISTENER=1 or when TELEGRAM_SIGNAL_CHAT + API_ID + API_HASH are set.
@@ -1753,6 +2008,13 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                 INSIDER_USD_MIN,
             )
             asyncio.create_task(_whale_insider_indexer_loop())
+
+        if os.getenv("DISABLE_AUTO_CLAIM_WINNINGS", "").strip().lower() not in ("1", "true", "yes"):
+            logging.getLogger(__name__).info(
+                "[autotrader] Auto-claim winnings loop enabled (interval=%ss, all users with wallet)",
+                os.getenv("AUTO_CLAIM_INTERVAL_SEC", "600"),
+            )
+            asyncio.create_task(_auto_claim_winnings_loop())
 
     @app.get("/health", tags=["system"], summary="Health check")
     async def health():

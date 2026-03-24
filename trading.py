@@ -20,6 +20,13 @@ from bot_tools import (
 logger = logging.getLogger(__name__)
 
 
+def _poly_err_payload(e: PolyApiException):
+    """py_clob_client uses `error_msg`; older code referenced `error_message`."""
+    if hasattr(e, "error_msg"):
+        return e.error_msg
+    return getattr(e, "error_message", None)
+
+
 def _log_clob_error(
     e: PolyApiException,
     context: str,
@@ -28,7 +35,7 @@ def _log_clob_error(
 ) -> None:
     """Log CLOB API error with status code, response body, and request context for debugging 400s."""
     status_code = getattr(e, "status_code", None)
-    err_body = getattr(e, "error_message", None)
+    err_body = _poly_err_payload(e)
     try:
         body_str = json.dumps(err_body, default=str) if err_body is not None else repr(err_body)
     except Exception:
@@ -46,7 +53,7 @@ def _log_clob_error(
         except Exception:
             ctx_str = repr(request_ctx)
         logger.error("CLOB 400 DEBUG request_ctx=%s", ctx_str)
-    if status_code == 400 and err_body:
+    if status_code == 400 and err_body is not None and err_body != "":
         err_msg = err_body.get("error", str(err_body)) if isinstance(err_body, dict) else str(err_body)
         logger.error(
             "CLOB HTTP 400: %s | Check: balance/allowance for trading wallet, funder=Safe for sells, token_id/amount valid.",
@@ -76,9 +83,30 @@ def _create_clob_client(private_key: str, use_safe: bool, trading_addr: str) -> 
 
 def _is_allowance_error(exc: PolyApiException) -> bool:
     """Return True if the CLOB error is about missing balance or allowance."""
-    err = getattr(exc, "error_message", {}) or {}
-    msg = (err.get("error") or str(exc)).lower()
-    return "allowance" in msg or "not enough balance" in msg
+    err = _poly_err_payload(exc)
+    if isinstance(err, dict):
+        msg = (err.get("error") or err.get("message") or json.dumps(err, default=str) or str(exc)).lower()
+    elif err is not None and err != "":
+        msg = str(err).lower()
+    else:
+        msg = str(exc).lower()
+    needles = (
+        "allowance",
+        "not enough balance",
+        "insufficient balance",
+        "insufficient funds",
+        "balance too low",
+    )
+    return any(n in msg for n in needles)
+
+
+def _not_enough_usdc_message(trading_addr: str, balance: float | None, need_usd: float) -> str:
+    bal_part = f"${balance:.4f}" if balance is not None else "unknown"
+    return (
+        "❌ TRADE FAILED: not enough USDC.e in your trading wallet "
+        f"(balance {bal_part}, need ~${need_usd:.2f}).\n"
+        "Deposit USDC.e to your Safe trading wallet and check /balance."
+    )
 
 
 def _force_reapprove(db: DatabaseManager, user_id: int, owner_addr: str) -> bool:
@@ -257,6 +285,15 @@ def execute_trade_for_user(
     if order_side_clean not in ("BUY", "SELL"):
         order_side_clean = "BUY"
 
+    # BUY market orders spend USDC.e from the trading (Safe) wallet; re-approval cannot create funds.
+    if order_side_clean == "BUY" and amount_value > 0 and trading_addr:
+        try:
+            bal0 = get_usdc_e_balance_on_polygon(trading_addr)
+            if bal0 is not None and bal0 + 1e-6 < amount_value:
+                return _not_enough_usdc_message(trading_addr, bal0, amount_value)
+        except Exception:
+            pass
+
     order_id = status = tx_hash = None
     fok_failed = False
 
@@ -300,30 +337,60 @@ def execute_trade_for_user(
                 },
             )
 
-            err = getattr(e, "error_message", {}) or {}
-            last_error = err.get("error") or str(e)
+            payload = _poly_err_payload(e)
+            if isinstance(payload, dict):
+                last_error = payload.get("error") or payload.get("message") or json.dumps(payload, default=str)
+            elif payload is not None and payload != "":
+                last_error = str(payload)
+            else:
+                last_error = str(e)
 
             # Check if this is an allowance/balance error
             if _is_allowance_error(e):
                 if attempt == 0:
+                    usdc_bal = None
                     try:
                         usdc_bal = get_usdc_e_balance_on_polygon(trading_addr)
                         logger.warning(
-                            "Trade attempt 1 failed with allowance error for user %s; "
+                            "Trade attempt 1 failed with allowance/balance error for user %s; "
                             "trading_addr=%s USDC.e_balance=%.4f; forcing gasless re-approval and retrying...",
                             user_id, trading_addr, usdc_bal if usdc_bal is not None else 0.0,
                         )
                     except Exception:
                         logger.warning(
-                            "Trade attempt 1 failed with allowance error for user %s; "
+                            "Trade attempt 1 failed with allowance/balance error for user %s; "
                             "trading_addr=%s; forcing gasless re-approval and retrying...",
                             user_id, trading_addr,
                         )
+                    if (
+                        order_side_clean == "BUY"
+                        and usdc_bal is not None
+                        and usdc_bal + 1e-6 < amount_value
+                    ):
+                        logger.info(
+                            "Skipping re-approval for user %s: BUY notional exceeds USDC.e balance on trading wallet",
+                            user_id,
+                        )
+                        try:
+                            db.record_trade(
+                                user_id=user_id, market_id=m.market_id, side=side_clean,
+                                amount=amount_value, status="error", order_id=None,
+                                tx_hash="", executed_at=int(time.time()),
+                                copied_from_user_id=copied_from_user_id,
+                                condition_id=m.condition_id,
+                            )
+                        except Exception:
+                            pass
+                        return _not_enough_usdc_message(trading_addr, usdc_bal, amount_value)
                     _force_reapprove(db, user_id, owner_addr)
                     time.sleep(5)
                     continue
                 else:
-                    # Allowance error after re-approval
+                    ub = None
+                    try:
+                        ub = get_usdc_e_balance_on_polygon(trading_addr)
+                    except Exception:
+                        pass
                     try:
                         db.record_trade(
                             user_id=user_id, market_id=m.market_id, side=side_clean,
@@ -334,6 +401,12 @@ def execute_trade_for_user(
                         )
                     except Exception:
                         pass
+                    if (
+                        order_side_clean == "BUY"
+                        and ub is not None
+                        and ub + 1e-6 < amount_value
+                    ):
+                        return _not_enough_usdc_message(trading_addr, ub, amount_value)
                     return (
                         "❌ TRADE FAILED: not enough balance or allowance on your trading wallet.\n"
                         "Make sure you have USDC.e in your Safe trading wallet (see /balance)."
@@ -541,8 +614,13 @@ def execute_limit_order_for_user(
                 "condition_id": m.condition_id[:20] + "..." if m.condition_id else None,
             },
         )
-        err = getattr(e, "error_message", {}) or {}
-        msg = err.get("error") or str(e)
+        payload = _poly_err_payload(e)
+        if isinstance(payload, dict):
+            msg = payload.get("error") or payload.get("message") or json.dumps(payload, default=str)
+        elif payload is not None and payload != "":
+            msg = str(payload)
+        else:
+            msg = str(e)
         logger.error("Limit order failed: %s", msg)
         return (
             "❌ LIMIT ORDER FAILED: not enough balance or allowance on your trading wallet.\n"

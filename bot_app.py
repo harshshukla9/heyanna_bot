@@ -183,6 +183,7 @@ BOT_COMMANDS = [
     BotCommand("trending", "Alias for /markets"),
     BotCommand("category", "Markets by category (politics, crypto, etc.)"),
     BotCommand("approve", "Run gasless approvals for trading"),
+    BotCommand("claimall", "Claim all settled winnings"),
     BotCommand("swap", "Swap USDC.e → bridged USDC"),
     BotCommand("close", "How to close positions"),
     BotCommand("menu", "Show command buttons"),
@@ -1123,6 +1124,9 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 InlineKeyboardButton("➕ Deposit", callback_data="deposit:wallet"),
                 InlineKeyboardButton("🔁 EOA → Safe", callback_data="transfer:safe"),
                 InlineKeyboardButton("➖ Withdraw", callback_data="withdraw:funds"),
+            ],
+            [
+                InlineKeyboardButton("🏆 Claim All Winnings", callback_data="claim:all"),
             ],
             [
                 InlineKeyboardButton("📈 View / close positions", callback_data="portfolio:view"),
@@ -2497,7 +2501,31 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                         continue
 
                     try:
-                        await app.bot.send_message(chat_id=uid, text=text)
+                        if text.startswith("CARD_URL:"):
+                            rest = text[len("CARD_URL:") :].lstrip()
+                            parts = rest.split("\n", 1)
+                            photo_url = (parts[0] or "").strip()
+                            caption = (
+                                (parts[1] if len(parts) > 1 else "").strip()
+                                or "Notification"
+                            )
+                            cap = strip_emoji(caption)[:1024]
+                            if photo_url.startswith("http://") or photo_url.startswith("https://"):
+                                try:
+                                    await app.bot.send_photo(
+                                        chat_id=uid,
+                                        photo=photo_url,
+                                        caption=cap,
+                                    )
+                                except Exception:
+                                    await app.bot.send_message(
+                                        chat_id=uid,
+                                        text=cap + f"\n\n(Card: {photo_url})",
+                                    )
+                            else:
+                                await app.bot.send_message(chat_id=uid, text=strip_emoji(rest))
+                        else:
+                            await app.bot.send_message(chat_id=uid, text=text)
                         db.execute(
                             "UPDATE signal_notifications_outbox SET sent_at = ? WHERE id = ?;",
                             (int(time.time()), oid),
@@ -3545,6 +3573,26 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 )
             return
 
+        if data == "claim:all":
+            # Claim all redeemable winnings via gasless relayer.
+            if query.message:
+                await _safe_edit_message(
+                    query,
+                    "🏆 Scanning redeemable positions and submitting gasless claim(s)…",
+                    parse_mode="Markdown",
+                )
+            result = await asyncio.to_thread(
+                bot_tools.claim_polymarket_winnings,
+                address,
+            )
+            if query.message:
+                await _safe_edit_message(
+                    query,
+                    strip_emoji(result),
+                    parse_mode="Markdown",
+                )
+            return
+
         if data == "transfer:safe":
             # Transfer all bridged USDC.e from EOA to Safe trading wallet.
             if query.message:
@@ -3742,6 +3790,20 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                     )
             except Exception:
                 pass
+        await update.message.reply_text(strip_emoji(result))
+
+    async def claimall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Manually claim all redeemable winnings via gasless relayer."""
+        user = update.effective_user
+        db_user = db.get_user(user.id)
+        if not db_user:
+            await update.message.reply_text("Please run /start first.")
+            return
+        address = db_user.get("eth_address", "")
+        await update.message.reply_text(
+            "🏆 Scanning redeemable positions and submitting gasless claim(s)…"
+        )
+        result = await asyncio.to_thread(bot_tools.claim_polymarket_winnings, address)
         await update.message.reply_text(strip_emoji(result))
 
     async def limit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4599,6 +4661,7 @@ _Tap buttons below to trade or analyze._"""
     app.add_handler(CommandHandler("trending", markets_cmd))
     app.add_handler(CommandHandler("category", category_cmd))
     app.add_handler(CommandHandler("approve", approve_cmd))
+    app.add_handler(CommandHandler("claimall", claimall_cmd))
     app.add_handler(CommandHandler("swap", swap_cmd))
     app.add_handler(CommandHandler("transfer_to_safe", transfer_to_safe_cmd))
     app.add_handler(CommandHandler("close", close_cmd))
@@ -4612,7 +4675,7 @@ _Tap buttons below to trade or analyze._"""
     # Inline button callbacks: markets menu, portfolio menu, category, market selection, trade
     app.add_handler(CallbackQueryHandler(handle_markets_menu_callback, pattern=r"^markets:(trending|volume|closing|category|back)$"))
     app.add_handler(CallbackQueryHandler(handle_markets_page_callback, pattern=r"^markets_page:[^:]+:\d+$"))
-    app.add_handler(CallbackQueryHandler(handle_portfolio_menu_callback, pattern=r"^(portfolio:view|deposit:wallet|withdraw:funds|transfer:safe)$"))
+    app.add_handler(CallbackQueryHandler(handle_portfolio_menu_callback, pattern=r"^(portfolio:view|deposit:wallet|withdraw:funds|transfer:safe|claim:all)$"))
     app.add_handler(CallbackQueryHandler(handle_help_menu_callback, pattern=r"^help:(first_trade|account|funds|copy)$"))
     app.add_handler(
         CallbackQueryHandler(

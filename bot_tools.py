@@ -680,6 +680,37 @@ def _fetch_closed_positions(address: str) -> list[dict]:
         return []
 
 
+def _normalize_condition_id(cid: str) -> str:
+    c = (cid or "").strip().lower()
+    if not c:
+        return ""
+    if c.startswith("0x"):
+        c = c[2:]
+    return "0x" + c
+
+
+def _merge_positions_for_claim(redeemable: list, closed: list) -> list[dict]:
+    """Deduplicate by conditionId; prefer fields from redeemable list when both exist."""
+    by_cid: dict[str, dict] = {}
+    for p in (redeemable or []):
+        if not isinstance(p, dict):
+            continue
+        raw = p.get("conditionId") or p.get("condition_id") or ""
+        key = _normalize_condition_id(str(raw))
+        if key:
+            by_cid[key] = {**p, "conditionId": key}
+    for p in (closed or []):
+        if not isinstance(p, dict):
+            continue
+        raw = p.get("conditionId") or p.get("condition_id") or ""
+        key = _normalize_condition_id(str(raw))
+        if not key:
+            continue
+        if key not in by_cid:
+            by_cid[key] = {**p, "conditionId": key}
+    return list(by_cid.values())
+
+
 def _fetch_redeemable_positions(address: str) -> list[dict]:
     """Fetch redeemable positions for a wallet via Data API."""
     trading_addr = _get_trading_wallet_address(address)
@@ -691,6 +722,64 @@ def _fetch_redeemable_positions(address: str) -> list[dict]:
     except Exception as e:
         logging.debug(f"Error fetching redeemable positions for {address}: {e}")
         return []
+
+
+def summarize_redeemable_positions_for_pnl_card(address: str) -> dict | None:
+    """
+    Aggregate redeemable position metrics for a PnL share card (before/around claim).
+    Uses the user's trading wallet (Safe when configured). Returns None if nothing redeemable.
+    """
+    positions = _fetch_redeemable_positions(address)
+    if not positions:
+        return None
+    total_cash = 0.0
+    total_initial = 0.0
+    titles: list[str] = []
+    outcomes: list[str] = []
+    n = 0
+    for p in positions:
+        if not isinstance(p, dict):
+            continue
+        n += 1
+        try:
+            cp = float(p.get("cashPnl") or p.get("realizedPnl") or 0.0)
+        except (TypeError, ValueError):
+            cp = 0.0
+        if cp == 0.0:
+            try:
+                cv = float(p.get("currentValue") or 0.0)
+                iv = float(p.get("initialValue") or 0.0)
+                cp = cv - iv
+            except (TypeError, ValueError):
+                pass
+        total_cash += cp
+        try:
+            total_initial += float(p.get("initialValue") or p.get("totalBought") or 0.0)
+        except (TypeError, ValueError):
+            pass
+        t = (p.get("title") or "").strip()
+        if t and t not in titles:
+            titles.append(t)
+        o = (p.get("outcome") or "").strip()
+        if o and o not in outcomes:
+            outcomes.append(o)
+    if not n:
+        return None
+    if len(titles) == 1:
+        title = titles[0][:200]
+    elif titles:
+        title = f"{n} redeemable markets"
+    else:
+        title = "Polymarket redemption"
+    outcome = outcomes[0][:80] if len(outcomes) == 1 else "Multiple outcomes"
+    pnl_pct = (total_cash / total_initial * 100.0) if total_initial > 0 else None
+    return {
+        "title": title,
+        "outcome": outcome,
+        "pnl_cash": total_cash,
+        "pnl_percent": pnl_pct,
+        "position_count": int(n),
+    }
 
 
 def _fetch_payout_info(condition_id: str) -> dict | None:
@@ -734,6 +823,16 @@ def _fetch_payout_info(condition_id: str) -> dict | None:
         return None
 
 
+def _payout_vector_entry_positive(amount) -> bool:
+    """True if this payout slot is a winning outcome (handles int/float/str from APIs)."""
+    if isinstance(amount, bool):
+        return False
+    try:
+        return float(amount) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _get_winning_indices(payout_info: dict) -> list[int]:
     """
     Extract winning outcome indices from payout info.
@@ -749,11 +848,15 @@ def _get_winning_indices(payout_info: dict) -> list[int]:
 
     winning = []
     for i, amount in enumerate(payout):
-        if amount > 0:
+        if _payout_vector_entry_positive(amount):
             # Convert to 1-indexed as required by CTF
             winning.append(i + 1)
 
     return winning
+
+
+# Returned when positions exist but winner/payout could not be resolved; auto-claim loop keys off this.
+AUTOCLAIM_PAYOUT_UNRESOLVED_MARK = "[autoclaim] payout winner not available"
 
 
 @mcp.tool()
@@ -778,16 +881,21 @@ def claim_polymarket_winnings(address: str) -> str:
         return "Gasless relay is not configured on this server."
 
     redeemable = _fetch_redeemable_positions(address)
-    source_positions = redeemable if redeemable else _fetch_closed_positions(address)
+    closed = _fetch_closed_positions(address)
+    if redeemable:
+        source_positions = _merge_positions_for_claim(redeemable, closed)
+    else:
+        source_positions = closed
     if not source_positions:
         return "No unclaimed winnings."
 
     # Group positions by conditionId and track which ones have winnings
     condition_payouts: dict[str, dict] = {}
     for p in source_positions:
-        cid = p.get("conditionId") or p.get("condition_id") or ""
+        raw = p.get("conditionId") or p.get("condition_id") or ""
+        cid = _normalize_condition_id(str(raw))
         if cid:
-            condition_payouts[cid] = p
+            condition_payouts[cid] = {**p, "conditionId": cid}
 
     if not condition_payouts:
         return "No unclaimed winnings."
@@ -845,6 +953,13 @@ def claim_polymarket_winnings(address: str) -> str:
         )
 
     if not txs:
+        if condition_payouts:
+            return (
+                f"{AUTOCLAIM_PAYOUT_UNRESOLVED_MARK} — Polymarket shows "
+                f"{len(condition_payouts)} resolved position(s) on your trading wallet, but the "
+                "payout API did not return a winner vector yet (or it is still syncing). "
+                "You can claim from polymarket.com; auto-claim will retry on the next tick."
+            )
         return "No unclaimed winnings."
 
     try:

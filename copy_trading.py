@@ -326,6 +326,12 @@ class CopyTradingManager:
 
         condition_id = trade.get("conditionId") or trade.get("asset")
         outcome = trade.get("outcome") or ""
+        outcome_token_id = trade.get("tokenID") or trade.get("token_id")
+        oi_raw = trade.get("outcomeIndex")
+        try:
+            outcome_index = int(oi_raw) if oi_raw is not None and str(oi_raw).strip() != "" else None
+        except (TypeError, ValueError):
+            outcome_index = None
         side = (trade.get("side") or "BUY").upper()
         price = float(trade.get("price") or 0)
         size = float(trade.get("size") or 0)
@@ -395,7 +401,9 @@ class CopyTradingManager:
                         condition_id=condition_id,
                         order_side=order_side,
                         leader_address=leader,
-                        hook_id=hook_id
+                        hook_id=hook_id,
+                        token_id=outcome_token_id,
+                        outcome_index=outcome_index,
                     )
 
                 # Check if trade succeeded based on result
