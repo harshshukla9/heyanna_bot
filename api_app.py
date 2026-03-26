@@ -6304,5 +6304,9 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
             "analysis_markdown": strip_emoji(analysis),
         }
 
+    from referral_api import register_referral_routes
+
+    register_referral_routes(app, db, bearer_scheme)
+
     return app
 
