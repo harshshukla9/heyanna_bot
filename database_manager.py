@@ -719,6 +719,22 @@ class DatabaseManager:
                 """
             )
 
+            # Analysis fee transaction log (x402-style payment gate on Base).
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS analysis_fee_transactions (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id       INTEGER NOT NULL,
+                    amount_usdc   TEXT NOT NULL,
+                    tx_hash       TEXT NOT NULL,
+                    chain_id      INTEGER NOT NULL DEFAULT 8453,
+                    fee_recipient TEXT NOT NULL,
+                    created_at    INTEGER NOT NULL,
+                    FOREIGN KEY (user_id) REFERENCES users(user_id)
+                );
+                """
+            )
+
             # Encrypt legacy plaintext keys when encryption is configured.
             self._migrate_encrypt_user_keys(conn)
 
@@ -745,6 +761,26 @@ class DatabaseManager:
             (username,),
         ).fetchone()
         return self._decode_user_row(row)
+
+    def log_analysis_fee(
+        self,
+        user_id: int,
+        amount_usdc: str,
+        tx_hash: str,
+        fee_recipient: str,
+        chain_id: int = 8453,
+    ) -> None:
+        """Record an analysis fee payment transaction."""
+        import time as _time
+
+        self.execute(
+            """
+            INSERT INTO analysis_fee_transactions
+                (user_id, amount_usdc, tx_hash, chain_id, fee_recipient, created_at)
+            VALUES (?, ?, ?, ?, ?, ?);
+            """,
+            (user_id, amount_usdc, tx_hash, chain_id, fee_recipient, int(_time.time())),
+        )
 
     def create_user(self, user_id: int, username: str, eth_data: dict, sol_data: Any) -> None:
         if isinstance(sol_data, dict):

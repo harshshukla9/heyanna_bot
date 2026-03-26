@@ -4784,6 +4784,22 @@ _Tap buttons below to trade or analyze._"""
 
         question = _mget(m, "question", "") or "this market"
 
+        # x402-style payment gate: charge USDC fee on Base before analysis
+        from base_payments import charge_analysis_fee, ANALYSIS_FEE_USDC, ANALYSIS_FEE_ENABLED
+        if ANALYSIS_FEE_ENABLED:
+            await _safe_edit_message(
+                query,
+                f"Processing payment ({ANALYSIS_FEE_USDC} USDC on Base)...",
+            )
+            user_id = query.from_user.id
+            success, result_msg = await asyncio.to_thread(charge_analysis_fee, user_id, db)
+            if not success:
+                await _safe_edit_message(
+                    query,
+                    f"Payment required for AI analysis ({ANALYSIS_FEE_USDC} USDC on Base).\n\n{result_msg}",
+                )
+                return
+
         # Run the multi-stage news-grounded analysis using the market question
         await _safe_edit_message(
             query,
