@@ -95,7 +95,7 @@ a.json
 !pyproject.toml
 
 # -----------------------------
-# Local agent/tooling directories
+# Local agent/tooling directories & nested repos
 # -----------------------------
 .agents/
 .claude/

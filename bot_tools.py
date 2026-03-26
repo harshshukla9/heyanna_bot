@@ -2354,13 +2354,16 @@ def execute_trade(market_id: int, side: str, amount: str, address: str) -> str:
     for attempt in range(2):
         try:
             # Per Polymarket skill: one client with funder, set_api_creds(create_or_derive_api_creds())
+            from trading import _make_builder_config, BUILDER_FEE_RATE_BPS
             client = ClobClient(
                 host="https://clob.polymarket.com", chain_id=137, key=private_key,
                 signature_type=2 if use_safe else 0,
                 funder=trading_addr if use_safe else None,
+                builder_config=_make_builder_config(),
             )
             client.set_api_creds(client.create_or_derive_api_creds())
-            order_args = MarketOrderArgs(token_id=token_id, amount=amount_float, side="BUY")
+            order_args = MarketOrderArgs(token_id=token_id, amount=amount_float, side="BUY",
+                                         fee_rate_bps=BUILDER_FEE_RATE_BPS)
             signed_order = client.create_market_order(order_args)
             resp = client.post_order(signed_order, orderType=OrderType.FOK)
 
@@ -2481,13 +2484,16 @@ def execute_sell_position(market_id: int, outcome: str, shares: float, address: 
                 trading_addr, use_safe, token_id, shares_float, funder or "(EOA)",
             )
             # Per Polymarket skill: one client with funder, set_api_creds(create_or_derive_api_creds())
+            from trading import _make_builder_config, BUILDER_FEE_RATE_BPS
             client = ClobClient(
                 host="https://clob.polymarket.com", chain_id=137, key=private_key,
                 signature_type=2 if use_safe else 0,
                 funder=funder,
+                builder_config=_make_builder_config(),
             )
             client.set_api_creds(client.create_or_derive_api_creds())
-            order_args = MarketOrderArgs(token_id=token_id, amount=shares_float, side="SELL")
+            order_args = MarketOrderArgs(token_id=token_id, amount=shares_float, side="SELL",
+                                         fee_rate_bps=BUILDER_FEE_RATE_BPS)
             signed_order = client.create_market_order(order_args)
             resp = client.post_order(signed_order, orderType=OrderType.FOK)
 

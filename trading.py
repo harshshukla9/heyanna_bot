@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import time
 from typing import Union
 
@@ -18,6 +19,35 @@ from bot_tools import (
 
 
 logger = logging.getLogger(__name__)
+
+# Builder fee encoded into every order (basis points, 100 bps = 1%).
+# Set BUILDER_FEE_RATE_BPS in your .env to enable platform fees.
+BUILDER_FEE_RATE_BPS: int = int(os.getenv("BUILDER_FEE_RATE_BPS", "0") or "0")
+
+# Builder API credentials for fee attribution.
+# Obtain from your Polymarket builder account dashboard.
+_BUILDER_KEY = os.getenv("POLY_BUILDER_API_KEY", "")
+_BUILDER_SECRET = os.getenv("POLY_BUILDER_SECRET", "")
+_BUILDER_PASSPHRASE = os.getenv("POLY_BUILDER_PASSPHRASE", "")
+
+
+def _make_builder_config():
+    """Return a BuilderConfig if credentials are configured, else None."""
+    if not (_BUILDER_KEY and _BUILDER_SECRET and _BUILDER_PASSPHRASE):
+        return None
+    try:
+        from py_builder_signing_sdk.config import BuilderConfig
+        from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
+        return BuilderConfig(
+            local_builder_creds=BuilderApiKeyCreds(
+                key=_BUILDER_KEY,
+                secret=_BUILDER_SECRET,
+                passphrase=_BUILDER_PASSPHRASE,
+            )
+        )
+    except Exception as e:
+        logger.warning("Builder config init failed: %s", e)
+        return None
 
 
 def _poly_err_payload(e: PolyApiException):
@@ -69,6 +99,8 @@ def _create_clob_client(private_key: str, use_safe: bool, trading_addr: str) -> 
     """
     Create an authenticated ClobClient per Polymarket skill: one client with funder,
     derive creds on it, then set_api_creds so creds are bound to that funder (Safe).
+    Builder config is attached when POLY_BUILDER_* env vars are set so that
+    fee_rate_bps orders are attributed to the platform builder account.
     """
     client = ClobClient(
         host="https://clob.polymarket.com",
@@ -76,6 +108,7 @@ def _create_clob_client(private_key: str, use_safe: bool, trading_addr: str) -> 
         key=private_key,
         signature_type=2 if use_safe else 0,
         funder=trading_addr if use_safe else None,
+        builder_config=_make_builder_config(),
     )
     client.set_api_creds(client.create_or_derive_api_creds())
     return client
@@ -305,6 +338,7 @@ def execute_trade_for_user(
                 token_id=token_id,
                 amount=amount_value,
                 side=order_side_clean,
+                fee_rate_bps=BUILDER_FEE_RATE_BPS,
             )
             signed_order = trade_client.create_market_order(order_args)
 
@@ -585,6 +619,7 @@ def execute_limit_order_for_user(
             price=price_val,
             size=size_val,
             side=side_const,
+            fee_rate_bps=BUILDER_FEE_RATE_BPS,
         )
         signed_order = trade_client.create_order(order_args, options=options)
 
