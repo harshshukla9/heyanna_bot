@@ -6520,7 +6520,10 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         tags=["analysis"],
         summary="Analyze a market with news, forecast, and risk score",
     )
-    async def analyze_market(body: AnalyzeMarketRequest):
+    async def analyze_market(
+        body: AnalyzeMarketRequest,
+        current=Depends(_get_current_session),
+    ):
         """
         High-level market analysis helper.
 
@@ -6532,7 +6535,26 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
             * market view
             * prediction with probability
             * 0–100 risk score with explanation.
+
+        Requires authentication and charges a USDC fee on Base (x402).
         """
+        from base_payments import charge_analysis_fee, ANALYSIS_FEE_USDC, ANALYSIS_FEE_ENABLED
+
+        if ANALYSIS_FEE_ENABLED:
+            user_id = current["user_id"]
+            success, result_msg = await asyncio.to_thread(charge_analysis_fee, user_id, db)
+            if not success:
+                raise HTTPException(
+                    status_code=402,
+                    detail={
+                        "error": "payment_required",
+                        "message": result_msg,
+                        "fee_usdc": str(ANALYSIS_FEE_USDC),
+                        "chain": "base",
+                        "chain_id": 8453,
+                    },
+                )
+
         analysis = await llm.run_market_analysis(body.query)
         return {
             "query": body.query,
