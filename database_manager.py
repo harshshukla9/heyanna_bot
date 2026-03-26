@@ -382,6 +382,18 @@ class DatabaseManager:
                 )
             except sqlite3.OperationalError:
                 pass
+            try:
+                conn.execute(
+                    "ALTER TABLE users ADD COLUMN signal_5m_limit_price REAL DEFAULT 0.55;"
+                )
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute(
+                    "ALTER TABLE users ADD COLUMN signal_15m_limit_price REAL DEFAULT 0.55;"
+                )
+            except sqlite3.OperationalError:
+                pass
 
             # Optional column for order_id if upgrading an existing DB.
             try:

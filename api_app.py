@@ -704,6 +704,9 @@ def _get_balance_json_cached(addr: str) -> Dict[str, Any]:
     if cached is not None:
         return cached
     out = bot_tools.get_polygon_balance_json(addr)
+    # Do not cache hard failures — avoids "everyone at $0" for the full TTL after an RPC blip.
+    if isinstance(out, dict) and out.get("error"):
+        return out
     _cache_set(key, out)
     return out
 
@@ -1326,6 +1329,9 @@ def _build_pnl_card_image_url(
     outcome = ""
     pnl_cash = 0.0
     pct_str = ""
+    entry_price_str = ""
+    exit_price_str = ""
+    date_str = ""
     card_mode: str | None = None
     url: str | None = None
     err_msg: str | None = None
@@ -1337,6 +1343,21 @@ def _build_pnl_card_image_url(
         pnl_cash = float(payload.get("pnl_cash") or 0.0)
         pnl_pct = payload.get("pnl_percent")
         pct_str = f"{float(pnl_pct):.2f}" if pnl_pct is not None else ""
+        ep = payload.get("entry_price")
+        try:
+            entry_price_str = f"{float(ep):.4f}" if ep is not None else ""
+        except Exception:
+            entry_price_str = ""
+        xp = payload.get("exit_price")
+        try:
+            exit_price_str = f"{float(xp):.4f}" if xp is not None else ""
+        except Exception:
+            exit_price_str = ""
+        # Human date string (for footer). Notification cards can omit/ignore.
+        try:
+            date_str = datetime.utcnow().strftime("%b %d, %Y")
+        except Exception:
+            date_str = ""
 
         tpl = (os.getenv("PNL_CARD_IMAGE_URL_TEMPLATE") or "").strip()
         if tpl:
@@ -1356,6 +1377,9 @@ def _build_pnl_card_image_url(
                     "outcome": outcome[:80],
                     "pnl_cash": f"{pnl_cash:.2f}",
                     "pnl_percent": pct_str or "0",
+                    "entry_price": entry_price_str,
+                    "exit_price": exit_price_str,
+                    "date": date_str,
                 }
             )
             url = f"{origin}/share/pnl-card.png?{qs}"
@@ -1624,16 +1648,20 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                 if timeframe == "5m":
                     enabled_col = "signal_5m_enabled"
                     amount_col = "signal_5m_amount_usd"
+                    limit_col = "signal_5m_limit_price"
                 elif timeframe == "15m":
                     enabled_col = "signal_15m_enabled"
                     amount_col = "signal_15m_amount_usd"
+                    limit_col = "signal_15m_limit_price"
                 else:
                     # Default to legacy settings
                     enabled_col = "signal_trading_enabled"
                     amount_col = "signal_trade_amount_usd"
+                    limit_col = None
 
+                select_limit = f", {limit_col}" if limit_col else ""
                 rows = db.execute(
-                    f"SELECT user_id, {amount_col} FROM users WHERE {enabled_col} = 1 AND COALESCE({amount_col}, 0) > 0;"
+                    f"SELECT user_id, {amount_col}{select_limit} FROM users WHERE {enabled_col} = 1 AND COALESCE({amount_col}, 0) > 0;"
                 ).fetchall()
 
                 if not rows:
@@ -1644,9 +1672,12 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                 for r in rows:
                     uid = int(r["user_id"])
                     amount_usd = float(r[amount_col] or 0.0)
+                    limit_price = float(r[limit_col] or LIMIT_ORDER_PRICE) if limit_col else LIMIT_ORDER_PRICE
+                    if limit_price < 0.01 or limit_price > 0.99:
+                        limit_price = LIMIT_ORDER_PRICE
                     if amount_usd <= 0:
                         continue
-                    user_tasks.append((uid, amount_usd))
+                    user_tasks.append((uid, amount_usd, limit_price))
 
                 if not user_tasks:
                     return
@@ -1669,8 +1700,8 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                 # Execute trades for all users in parallel using thread pool
                 with ThreadPoolExecutor(max_workers=len(user_tasks)) as executor:
                     futures = {
-                        executor.submit(_trade_for_user, db, uid, amt, signal_dict, USE_LIMIT_ORDERS, LIMIT_ORDER_PRICE): uid
-                        for uid, amt in user_tasks
+                        executor.submit(_trade_for_user, db, uid, amt, signal_dict, USE_LIMIT_ORDERS, lpx): uid
+                        for uid, amt, lpx in user_tasks
                     }
 
                     for future in as_completed(futures):
@@ -1685,23 +1716,74 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
 
         async def _auto_claim_winnings_loop() -> None:
             """
-            Auto-claim on a fixed cadence (default 10 minutes = cron-like):
-            - All users with a Polygon wallet are scanned each tick.
+            Auto-claim on a fixed cadence (default 2.5 minutes; override AUTO_CLAIM_INTERVAL_SEC):
+            - All users with a Polygon wallet are considered each tick.
+            - Claim runs only if the trading wallet has **redeemable** portfolio positions
+              (resolved markets with tokens to redeem per Data API); others are skipped.
             - Gasless redemption via bot_tools.claim_polymarket_winnings.
             - On successful submit, enqueue Telegram notification with PnL card image URL.
             """
-            # Default 600s (10 minutes); override with AUTO_CLAIM_INTERVAL_SEC if needed.
+            # Default 150s (2.5 minutes); override with AUTO_CLAIM_INTERVAL_SEC if needed.
             interval_sec = max(
                 60.0,
-                float(os.getenv("AUTO_CLAIM_INTERVAL_SEC", "600") or "600"),
+                float(os.getenv("AUTO_CLAIM_INTERVAL_SEC", "150") or "150"),
             )
             verbose_user_logs = os.getenv("AUTO_CLAIM_VERBOSE_USER_LOGS", "").strip().lower() in ("1", "true", "yes")
+            claim_concurrency = max(
+                1,
+                int(float(os.getenv("AUTO_CLAIM_CONCURRENCY", "8") or "8")),
+            )
 
             def _mask_wallet(addr: str) -> str:
                 a = (addr or "").strip()
                 if len(a) < 12:
                     return a
                 return f"{a[:8]}...{a[-6:]}"
+
+            async def _auto_claim_one_user(
+                r: dict,
+                sem: asyncio.Semaphore,
+            ) -> dict:
+                """Fetch redeemable + summarize + claim under semaphore; returns outcome dict."""
+                async with sem:
+                    uid = int(r["user_id"])
+                    addr = (r["eth_address"] or "").strip()
+                    if not addr:
+                        return {"kind": "no_addr"}
+                    redeemable = await asyncio.to_thread(
+                        bot_tools.fetch_redeemable_positions,
+                        addr,
+                    )
+                    if not redeemable:
+                        return {"kind": "skipped_no_redeemable", "uid": uid}
+                    stats = await asyncio.to_thread(
+                        bot_tools.summarize_redeemable_positions_for_pnl_cards,
+                        addr,
+                        redeemable,
+                    )
+                    # Keep this loop for PnL cards/notifications, but avoid on-chain
+                    # redemption unless explicitly enabled.
+                    execute_onchain = os.getenv(
+                        "AUTO_CLAIM_EXECUTE_ONCHAIN_REDEEM", ""
+                    ).strip().lower() in ("1", "true", "yes")
+                    if execute_onchain:
+                        result_text = await asyncio.to_thread(
+                            bot_tools.claim_polymarket_winnings,
+                            addr,
+                            redeemable,
+                        )
+                    else:
+                        # Stable marker to route notification message in the loop.
+                        result_text = (
+                            "[autoclaim] open polymarket (bot did not execute on-chain redeem)"
+                        )
+                    return {
+                        "kind": "processed",
+                        "uid": uid,
+                        "addr": addr,
+                        "stats": stats,
+                        "result_text": result_text,
+                    }
 
             while True:
                 tick_start = time.time()
@@ -1716,74 +1798,94 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
 
                     scanned = len(rows)
                     attempted = 0
+                    skipped_no_redeemable = 0
                     submitted = 0
+                    open_polymarket = 0
                     no_unclaimed = 0
                     payout_unresolved = 0
                     failed = 0
-                    for r in rows:
-                        uid = int(r["user_id"])
-                        addr = (r["eth_address"] or "").strip()
-                        if not addr:
+                    sem = asyncio.Semaphore(claim_concurrency)
+                    results = await asyncio.gather(
+                        *[_auto_claim_one_user(r, sem) for r in rows],
+                        return_exceptions=True,
+                    )
+
+                    for raw in results:
+                        if isinstance(raw, Exception):
+                            failed += 1
+                            logging.getLogger(__name__).warning(
+                                "[autotrader] Auto-claim user task error: %s",
+                                raw,
+                                exc_info=True,
+                            )
+                            continue
+                        if raw.get("kind") == "no_addr":
+                            continue
+                        if raw.get("kind") == "skipped_no_redeemable":
+                            skipped_no_redeemable += 1
                             continue
 
                         attempted += 1
-
-                        stats = await asyncio.to_thread(
-                            bot_tools.summarize_redeemable_positions_for_pnl_card,
-                            addr,
-                        )
-                        result_text = await asyncio.to_thread(
-                            bot_tools.claim_polymarket_winnings,
-                            addr,
-                        )
+                        uid = raw["uid"]
+                        addr = raw["addr"]
+                        stats = raw.get("stats")
+                        result_text = raw.get("result_text")
                         result_norm = str(result_text or "").strip()
                         result_lower = result_norm.lower()
 
                         if "submitted gasless claim" in result_lower:
                             submitted += 1
-                            payload = stats or {
-                                "title": "Winnings claimed",
-                                "outcome": "Redeemed",
-                                "pnl_cash": 0.0,
-                                "pnl_percent": None,
-                            }
+                            payloads = stats if isinstance(stats, list) else None
+                            if not payloads:
+                                payloads = [
+                                    {
+                                        "title": "Winnings claimed",
+                                        "outcome": "Redeemed",
+                                        "pnl_cash": 0.0,
+                                        "pnl_percent": None,
+                                    }
+                                ]
                             key = f"success:{result_norm}"
                             outbox_enqueued = False
-                            card_url: str | None = None
                             if _last_auto_claim_status.get(uid) != key:
                                 _last_auto_claim_status[uid] = key
-                                card_url = _build_pnl_card_image_url(
-                                    payload,
-                                    user_id=uid,
-                                    wallet_masked=_mask_wallet(addr),
-                                )
-                                msg_body = (
-                                    "🏆 Auto-claim submitted\n"
-                                    f"Est. PnL: ${float(payload.get('pnl_cash') or 0):+.2f}"
-                                    + (
-                                        f" ({float(payload.get('pnl_percent')):+.2f}%)"
-                                        if payload.get("pnl_percent") is not None
-                                        else ""
+                                for payload in payloads:
+                                    card_url = _build_pnl_card_image_url(
+                                        payload,
+                                        user_id=uid,
+                                        wallet_masked=_mask_wallet(addr),
                                     )
-                                    + "\n"
-                                    + result_norm
-                                )
-                                if card_url:
-                                    out_text = f"CARD_URL:{card_url}\n{msg_body}"
-                                else:
-                                    out_text = msg_body
-                                await _enqueue_outbox(
-                                    uid,
-                                    "signal_winnings_claim_submitted",
-                                    out_text,
-                                )
-                                outbox_enqueued = True
+                                    market_label = (payload.get("title") or "Market").strip()
+                                    est_cash = float(payload.get("pnl_cash") or 0)
+                                    est_pct = payload.get("pnl_percent")
+                                    msg_body = (
+                                        "🏆 Auto-claim submitted\n"
+                                        f"Market: {market_label}\n"
+                                        f"Est. PnL: ${est_cash:+.2f}"
+                                        + (
+                                            f" ({float(est_pct):+.2f}%)"
+                                            if est_pct is not None
+                                            else ""
+                                        )
+                                        + "\n"
+                                        + result_norm
+                                    )
+                                    if card_url:
+                                        out_text = f"CARD_URL:{card_url}\n{msg_body}"
+                                    else:
+                                        out_text = msg_body
+                                    await _enqueue_outbox(
+                                        uid,
+                                        "signal_winnings_claim_submitted",
+                                        out_text,
+                                    )
+                                    outbox_enqueued = True
                             _append_logs_text(
                                 "auto_claim.log",
                                 f"submit user_id={uid} wallet={_mask_wallet(addr)} "
-                                f"est_pnl={float(payload.get('pnl_cash') or 0):.2f} "
+                                f"est_pnl=<multi> "
                                 f"outbox={'yes' if outbox_enqueued else 'deduped'} "
-                                f"card_url={'yes' if card_url else 'no'}",
+                                f"card_url={'yes' if outbox_enqueued else 'no'}",
                             )
                             _append_logs_jsonl(
                                 "auto_claim.jsonl",
@@ -1792,14 +1894,88 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                                     "user_id": uid,
                                     "wallet_masked": _mask_wallet(addr),
                                     "result_excerpt": result_norm[:500],
-                                    "est_pnl_cash": float(payload.get("pnl_cash") or 0),
-                                    "est_pnl_percent": payload.get("pnl_percent"),
+                                    "est_pnl_cash": None,
+                                    "est_pnl_percent": None,
                                     "outbox_enqueued": outbox_enqueued,
-                                    "card_url_present": bool(card_url),
+                                    "card_url_present": outbox_enqueued,
                                 },
                             )
                             logging.getLogger(__name__).info(
                                 "[autotrader] Auto-claim submitted user=%s wallet=%s",
+                                uid,
+                                _mask_wallet(addr),
+                            )
+                        elif "open polymarket" in result_lower:
+                            # Notification-only mode: do not execute on-chain redemption.
+                            open_polymarket += 1
+                            payloads = stats if isinstance(stats, list) else None
+                            if not payloads:
+                                payloads = [
+                                    {
+                                        "title": "Winnings available",
+                                        "outcome": "Redeem on Polymarket",
+                                        "pnl_cash": 0.0,
+                                        "pnl_percent": None,
+                                    }
+                                ]
+                            # Dedup key per user per tick: stable marker + aggregated PnL.
+                            first_payload = payloads[0] if payloads else {}
+                            key = f"open_polymarket:{float(first_payload.get('pnl_cash') or 0):.2f}:{first_payload.get('pnl_percent')}"
+                            outbox_enqueued = False
+                            if _last_auto_claim_status.get(uid) != key:
+                                _last_auto_claim_status[uid] = key
+                                for payload in payloads:
+                                    card_url = _build_pnl_card_image_url(
+                                        payload,
+                                        user_id=uid,
+                                        wallet_masked=_mask_wallet(addr),
+                                    )
+                                    market_label = (payload.get("title") or "Market").strip()
+                                    est_cash = float(payload.get("pnl_cash") or 0)
+                                    est_pct = payload.get("pnl_percent")
+                                    msg_body = (
+                                        "🏆 Redeem on Polymarket\n"
+                                        f"Market: {market_label}\n"
+                                        f"Est. PnL: ${est_cash:+.2f}"
+                                        + (
+                                            f" ({float(est_pct):+.2f}%)"
+                                            if est_pct is not None
+                                            else ""
+                                        )
+                                        + "\n"
+                                        + "Open Polymarket to redeem your resolved winnings."
+                                    )
+                                    if card_url:
+                                        out_text = f"CARD_URL:{card_url}\n{msg_body}"
+                                    else:
+                                        out_text = msg_body
+                                    await _enqueue_outbox(
+                                        uid,
+                                        "signal_winnings_redeem_open_polymarket",
+                                        out_text,
+                                    )
+                                    outbox_enqueued = True
+                            _append_logs_text(
+                                "auto_claim.log",
+                                f"open_polymarket user_id={uid} wallet={_mask_wallet(addr)} "
+                                f"est_pnl=<multi> "
+                                f"outbox={'yes' if outbox_enqueued else 'deduped'} "
+                                f"card_url={'yes' if outbox_enqueued else 'no'}",
+                            )
+                            _append_logs_jsonl(
+                                "auto_claim.jsonl",
+                                {
+                                    "event": "claim_open_polymarket_prompt",
+                                    "user_id": uid,
+                                    "wallet_masked": _mask_wallet(addr),
+                                    "est_pnl_cash": None,
+                                    "est_pnl_percent": None,
+                                    "outbox_enqueued": outbox_enqueued,
+                                    "card_url_present": outbox_enqueued,
+                                },
+                            )
+                            logging.getLogger(__name__).info(
+                                "[autotrader] Auto-claim open_polymarket user=%s wallet=%s",
                                 uid,
                                 _mask_wallet(addr),
                             )
@@ -1878,11 +2054,13 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                             )
                     elapsed_ms = int((time.time() - tick_start) * 1000)
                     logging.getLogger(__name__).info(
-                        "[autotrader] Auto-claim tick scanned=%s attempted=%s submitted=%s "
-                        "no_unclaimed=%s payout_unresolved=%s failed=%s elapsed_ms=%s",
+                        "[autotrader] Auto-claim tick scanned=%s skipped_no_redeemable=%s attempted=%s "
+                        "submitted=%s open_polymarket=%s no_unclaimed=%s payout_unresolved=%s failed=%s elapsed_ms=%s",
                         scanned,
+                        skipped_no_redeemable,
                         attempted,
                         submitted,
+                        open_polymarket,
                         no_unclaimed,
                         payout_unresolved,
                         failed,
@@ -1890,17 +2068,21 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                     )
                     _append_logs_text(
                         "auto_claim.log",
-                        f"tick scanned={scanned} attempted={attempted} submitted={submitted} "
-                        f"no_unclaimed={no_unclaimed} payout_unresolved={payout_unresolved} "
-                        f"failed={failed} elapsed_ms={elapsed_ms}",
+                        f"tick scanned={scanned} skipped_no_redeemable={skipped_no_redeemable} "
+                        f"attempted={attempted} submitted={submitted} "
+                        f"open_polymarket={open_polymarket} no_unclaimed={no_unclaimed} "
+                        f"payout_unresolved={payout_unresolved} failed={failed} "
+                        f"elapsed_ms={elapsed_ms}",
                     )
                     _append_logs_jsonl(
                         "auto_claim.jsonl",
                         {
                             "event": "tick",
                             "scanned": scanned,
+                            "skipped_no_redeemable": skipped_no_redeemable,
                             "attempted": attempted,
                             "submitted": submitted,
+                            "open_polymarket": open_polymarket,
                             "no_unclaimed": no_unclaimed,
                             "payout_unresolved": payout_unresolved,
                             "failed": failed,
@@ -2009,10 +2191,14 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
             )
             asyncio.create_task(_whale_insider_indexer_loop())
 
+        # Auto-claim loop: generates PnL cards + notifications for redeemable positions.
+        # On-chain redemption is controlled per-user by AUTO_CLAIM_EXECUTE_ONCHAIN_REDEEM.
         if os.getenv("DISABLE_AUTO_CLAIM_WINNINGS", "").strip().lower() not in ("1", "true", "yes"):
             logging.getLogger(__name__).info(
-                "[autotrader] Auto-claim winnings loop enabled (interval=%ss, all users with wallet)",
-                os.getenv("AUTO_CLAIM_INTERVAL_SEC", "600"),
+                "[autotrader] Auto-claim winnings loop enabled (interval=%ss, concurrency=%s, "
+                "all users with wallet; set AUTO_CLAIM_CONCURRENCY to tune parallel fetches)",
+                os.getenv("AUTO_CLAIM_INTERVAL_SEC", "150"),
+                os.getenv("AUTO_CLAIM_CONCURRENCY", "8"),
             )
             asyncio.create_task(_auto_claim_winnings_loop())
 
@@ -3120,10 +3306,12 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
             "5m": {
                 "enabled": bool(user.get("signal_5m_enabled") or 0),
                 "shares": int(user.get("signal_5m_amount_usd") or 5),
+                "limit_price": float(user.get("signal_5m_limit_price") or LIMIT_ORDER_PRICE),
             },
             "15m": {
                 "enabled": bool(user.get("signal_15m_enabled") or 0),
                 "shares": int(user.get("signal_15m_amount_usd") or 5),
+                "limit_price": float(user.get("signal_15m_limit_price") or LIMIT_ORDER_PRICE),
             },
             "wallet": user.get("eth_address"),
             "trading_wallet": trading_wallet,
@@ -3133,6 +3321,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         timeframe: str  # "5m" or "15m"
         enabled: bool | None = None
         shares: int | None = None  # Number of shares (min 5)
+        limit_price: float | None = None  # Max limit order price per share
 
     @app.post(
         "/me/signal-trading/settings",
@@ -3153,14 +3342,19 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
 
         enabled = body.enabled
         shares = body.shares
+        limit_price = body.limit_price
         if shares is not None:
             if shares < 5:
                 raise HTTPException(status_code=400, detail="Minimum 5 shares.")
             if shares > 1000:
                 raise HTTPException(status_code=400, detail="Maximum 1000 shares.")
+        if limit_price is not None:
+            if limit_price < 0.01 or limit_price > 0.99:
+                raise HTTPException(status_code=400, detail="limit_price must be between 0.01 and 0.99.")
 
         enabled_col = "signal_5m_enabled" if timeframe == "5m" else "signal_15m_enabled"
         shares_col = "signal_5m_amount_usd" if timeframe == "5m" else "signal_15m_amount_usd"
+        limit_col = "signal_5m_limit_price" if timeframe == "5m" else "signal_15m_limit_price"
 
         with db.transaction() as conn:
             if enabled is not None:
@@ -3173,16 +3367,23 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                     f"UPDATE users SET {shares_col} = ? WHERE user_id = ?;",
                     (shares, user["user_id"]),
                 )
+            if limit_price is not None:
+                conn.execute(
+                    f"UPDATE users SET {limit_col} = ? WHERE user_id = ?;",
+                    (float(limit_price), user["user_id"]),
+                )
 
         user2 = db.get_user(user["user_id"]) or {}
         return {
             "5m": {
                 "enabled": bool(user2.get("signal_5m_enabled") or 0),
                 "shares": int(user2.get("signal_5m_amount_usd") or 5),
+                "limit_price": float(user2.get("signal_5m_limit_price") or LIMIT_ORDER_PRICE),
             },
             "15m": {
                 "enabled": bool(user2.get("signal_15m_enabled") or 0),
                 "shares": int(user2.get("signal_15m_amount_usd") or 5),
+                "limit_price": float(user2.get("signal_15m_limit_price") or LIMIT_ORDER_PRICE),
             },
         }
 

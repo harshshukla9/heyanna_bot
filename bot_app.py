@@ -1,10 +1,12 @@
 import asyncio
+import io
 import json
 import logging
 import os
 import re
 import time
 from typing import Dict, List
+from urllib.parse import parse_qs, urlparse, unquote_plus
 
 from telegram import Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update, ReplyKeyboardMarkup, User
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
@@ -74,6 +76,302 @@ MARKET_BANNERS: dict[str, str] = {
     "geopolitics": GEOPOLITICS_BANNER_PATH,
 }
 
+
+def _build_local_pnl_card_bytes_from_url(photo_url: str) -> io.BytesIO | None:
+    """
+    Recreate a PnL card image locally from the existing query-string format.
+    Uses local banner assets and avoids exposing the card URL in chat text.
+    """
+    try:
+        from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps
+    except Exception:
+        return None
+
+    try:
+        # ----- Parse query-string params from CARD_URL ----- #
+        parsed = urlparse(str(photo_url or "").strip())
+        q = parse_qs(parsed.query or "")
+
+        def _q(name: str, default: str = "") -> str:
+            vals = q.get(name) or []
+            if not vals:
+                return default
+            return unquote_plus(str(vals[0] or default))
+
+        title = (_q("title", "Winnings claimed") or "Winnings claimed").strip()
+        outcome = (_q("outcome", "Redeemed") or "Redeemed").strip()
+        pnl_cash_raw = _q("pnl_cash", "0")
+        pnl_pct_raw = _q("pnl_percent", "")
+        entry_price_raw = _q("entry_price", "")
+        exit_price_raw = _q("exit_price", "")
+        date_txt = (_q("date", "") or "").strip()
+
+        try:
+            pnl_cash = float(pnl_cash_raw)
+        except Exception:
+            pnl_cash = 0.0
+        try:
+            pnl_pct = float(pnl_pct_raw) if pnl_pct_raw not in ("", "None", "null") else None
+        except Exception:
+            pnl_pct = None
+
+        entry_price = None
+        try:
+            entry_price = float(entry_price_raw) if entry_price_raw not in ("", "None", "null") else None
+        except Exception:
+            entry_price = None
+        exit_price = None
+        try:
+            exit_price = float(exit_price_raw) if exit_price_raw not in ("", "None", "null") else None
+        except Exception:
+            exit_price = None
+
+        # ----- Design tokens (matches src route: 1200x630) ----- #
+        W, H = 1200, 630
+        PAD_LEFT, PAD_TOP, PAD_RIGHT, PAD_BOTTOM = 52, 44, 52, 40
+
+        # Colors (approx; used to match web OG card palette)
+        MUTED = (156, 163, 175)
+        WHITE = (255, 255, 255)
+        PROFIT = (34, 197, 94)
+        LOSS = (248, 113, 113)
+        ORANGE = (249, 115, 22)
+        PILL_ALPHA = int(255 * 0.45)
+        PILL_RGBA = (PROFIT[0], PROFIT[1], PROFIT[2], PILL_ALPHA)
+        LABEL_PNL_RGBA = (255, 255, 255, int(255 * 0.72))
+        FOOTER_RULE_COLOR = (255, 255, 255, int(255 * 0.28))
+
+        BRAND_LOGO_PX = 64
+        ICON_BOX = 56
+        ICON_RADIUS = 14
+        ICON_GAP = 18
+
+        MARKET_FONT_PX = 26
+        MARKET_MAX_W = 780
+        STATUS_FONT_PX = 15
+        PILL_W, PILL_H = 140, 9
+        STATUS_GAP = 12
+        MARKET_TO_PILL_GAP = 10
+
+        PNL_LABEL_FONT_PX = 18
+        PNL_CASH_FONT_PX = 92
+        PNL_PCT_FONT_PX = 36
+
+        HANDLE_FONT_PX = 17
+        FOOTER_LABEL_PX = 15
+        FOOTER_VALUE_PX = 30
+        FOOTER_COL_GAP = 44
+        FOOTER_DATE_PAD_LEFT = 44
+        FOOTER_RULE_W = 2
+
+        HEYANNA_WORDMARK_PX = 16
+        DEFAULT_HANDLE = "x.com/tryheyanna"
+
+        # ----- Fonts ----- #
+        dejavu_regular = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        dejavu_bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+        def _font(size: int, bold: bool = False) -> ImageFont.ImageFont:
+            fp = dejavu_bold if bold else dejavu_regular
+            if os.path.exists(fp):
+                try:
+                    return ImageFont.truetype(fp, size=size)
+                except Exception:
+                    pass
+            return ImageFont.load_default()
+
+        # ----- Base assets ONLY (background + logo) ----- #
+        base_path = os.path.join(ASSETS_DIR, "pnl-card-banner.png")
+        logo_path = os.path.join(ASSETS_DIR, "pnl-card-logo.png")
+        if not os.path.exists(base_path):
+            return None
+
+        bg = Image.open(base_path).convert("RGB")
+        card = ImageOps.fit(bg, (W, H), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)).convert("RGBA")
+
+        # ----- helpers ----- #
+        draw = ImageDraw.Draw(card)
+
+        def _text_width(font: ImageFont.ImageFont, text: str) -> float:
+            # Pillow's `textlength` exists on some versions; fall back to bbox.
+            if hasattr(draw, "textlength"):
+                return float(draw.textlength(text, font=font))
+            bbox = draw.textbbox((0, 0), text, font=font)
+            return float(bbox[2] - bbox[0])
+
+        def _wrap_market(text: str, font: ImageFont.ImageFont, max_w: int) -> list[str]:
+            words = (text or "").split()
+            if not words:
+                return [""]
+            lines: list[str] = []
+            cur: list[str] = []
+            for w in words:
+                trial = " ".join(cur + [w])
+                if cur and _text_width(font, trial) > max_w:
+                    lines.append(" ".join(cur))
+                    cur = [w]
+                else:
+                    cur.append(w)
+            if cur:
+                lines.append(" ".join(cur))
+            return lines
+
+        def _fmt_pnl_body(p: float) -> str:
+            a = abs(p)
+            if a >= 1_000_000:
+                return f"{a / 1_000_000:.2f}M"
+            if a >= 10_000:
+                return f"{a / 1_000:.2f}K"
+            # Keep full cents-like precision for small numbers.
+            s = f"{a:,.2f}".rstrip("0").rstrip(".")
+            return s
+
+        # ----- Resolve dynamic values ----- #
+        is_profit = pnl_cash >= 0
+        pnl_color = PROFIT if is_profit else LOSS
+        pill_fill = (PROFIT[0], PROFIT[1], PROFIT[2], PILL_ALPHA) if is_profit else (LOSS[0], LOSS[1], LOSS[2], PILL_ALPHA)
+
+        # Pill status: we only have `outcome` in this backend; use it.
+        status_txt = outcome
+
+        # PnL cash text: use the same sign style as the OG card.
+        sign = "+" if is_profit else "−"
+        pnl_cash_text = f"{sign}${_fmt_pnl_body(pnl_cash)}"
+
+        # PnL pct text
+        pct_known = pnl_pct is not None
+        if pct_known:
+            p = float(pnl_pct)  # type: ignore[arg-type]
+            pct_sign = "+" if p >= 0 else "−"
+            pnl_pct_text = f"{pct_sign}{abs(p):.2f}%"
+            pct_color = PROFIT if p >= 0 else LOSS
+        else:
+            pnl_pct_text = ""
+            pct_color = MUTED
+
+        # Footer fields: prices are derived from positions (passed via query params).
+        entry_txt = f"${entry_price:.4f}" if entry_price is not None else ""
+        exit_txt = f"${exit_price:.4f}" if exit_price is not None else ""
+        if not date_txt:
+            date_txt = " "
+        handle_txt = DEFAULT_HANDLE
+
+        # ----- Fonts (weight mapping: bold=DejaVuSans-Bold) ----- #
+        font_market = _font(MARKET_FONT_PX, bold=True)
+        font_status = _font(STATUS_FONT_PX, bold=False)
+        font_footer_lbl = _font(FOOTER_LABEL_PX, bold=False)
+        font_footer_val = _font(FOOTER_VALUE_PX, bold=True)
+        font_handle = _font(HANDLE_FONT_PX, bold=False)
+        font_pnl_label = _font(PNL_LABEL_FONT_PX, bold=True)
+        font_pnl_cash = _font(PNL_CASH_FONT_PX, bold=True)
+        font_pnl_pct = _font(PNL_PCT_FONT_PX, bold=True)
+        font_btc = _font(30, bold=True)
+
+        # ----- Header: icon + market + status pill ----- #
+        ix0, iy0 = PAD_LEFT, PAD_TOP
+        pill_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        pd = ImageDraw.Draw(pill_layer, "RGBA")
+        pd.rounded_rectangle((ix0, iy0, ix0 + ICON_BOX, iy0 + ICON_BOX), radius=ICON_RADIUS, fill=(*ORANGE, 255))
+        card = Image.alpha_composite(card, pill_layer)
+        draw = ImageDraw.Draw(card)
+
+        # BTC-ish icon (no remote icon in our backend)
+        sym = "₿"
+        sw = _text_width(font_btc, sym)
+        sh = font_btc.size + 4
+        draw.text((ix0 + (ICON_BOX - sw) / 2, iy0 + (ICON_BOX - sh) / 2 - 2), sym, font=font_btc, fill=WHITE)
+
+        # Market title next to icon.
+        tx = ix0 + ICON_BOX + ICON_GAP
+        lines = _wrap_market(title, font_market, MARKET_MAX_W)
+        ty = PAD_TOP
+        lh = int(MARKET_FONT_PX * 1.3)
+        for line in lines:
+            draw.text((tx, ty), line, font=font_market, fill=WHITE)
+            ty += lh
+
+        # Status pill below title lines.
+        pill_y = ty + MARKET_TO_PILL_GAP
+        pill_x1 = tx + PILL_W + STATUS_GAP
+        pill_overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        pd = ImageDraw.Draw(pill_overlay, "RGBA")
+        pd.rounded_rectangle((tx, pill_y, tx + PILL_W, pill_y + PILL_H), radius=PILL_H // 2, fill=pill_fill)
+        card = Image.alpha_composite(card, pill_overlay)
+        draw = ImageDraw.Draw(card)
+
+        draw.text((pill_x1, pill_y - 3), status_txt, font=font_status, fill=MUTED)
+
+        # ----- Top-right logo ----- #
+        if os.path.exists(logo_path):
+            logo = Image.open(logo_path).convert("RGBA")
+            logo = logo.resize((BRAND_LOGO_PX, BRAND_LOGO_PX), Image.Resampling.NEAREST)
+            lx0 = W - PAD_RIGHT - BRAND_LOGO_PX
+            ly0 = PAD_TOP
+            card.paste(logo, (lx0, ly0), logo)
+
+        # ----- Center: PnL ----- #
+        header_bottom = pill_y + PILL_H + 32
+        footer_top = H - PAD_BOTTOM - FOOTER_VALUE_PX - FOOTER_LABEL_PX - 20
+        cy = (header_bottom + footer_top) // 2 - 8
+
+        # "PnL" label (uppercase with custom tracking)
+        letters = ["P", "N", "L"]
+        track = 3
+        total_w = sum(_text_width(font_pnl_label, ch) for ch in letters) + track * (len(letters) - 1)
+        lx = (W - total_w) / 2
+        ly = cy - 110
+        for ch in letters:
+            draw.text((lx, ly), ch, font=font_pnl_label, fill=LABEL_PNL_RGBA)
+            lx += _text_width(font_pnl_label, ch) + track
+
+        # Cash line
+        cw = _text_width(font_pnl_cash, pnl_cash_text)
+        draw.text(((W - cw) / 2, cy - 40), pnl_cash_text, font=font_pnl_cash, fill=pnl_color)
+
+        # % line
+        if pct_known:
+            pw = _text_width(font_pnl_pct, pnl_pct_text)
+            draw.text(((W - pw) / 2, cy + int(PNL_CASH_FONT_PX * 0.95) - 28), pnl_pct_text, font=font_pnl_pct, fill=pct_color)
+
+        # ----- Footer ----- #
+        fy0 = H - PAD_BOTTOM - FOOTER_VALUE_PX - 8
+        fl0 = H - PAD_BOTTOM - FOOTER_VALUE_PX - FOOTER_LABEL_PX - 6
+
+        lbl_entry = "Avg Entry Price"
+        lbl_exit = "Exit Price"
+        lbl_date = "Date"
+
+        # Three-column footer: Entry | Exit | Date.
+        w_col1 = max(_text_width(font_footer_lbl, lbl_entry), _text_width(font_footer_val, entry_txt or " "))
+        w_col2 = max(_text_width(font_footer_lbl, lbl_exit), _text_width(font_footer_val, exit_txt or " "))
+
+        fx1 = PAD_LEFT
+        fx2 = fx1 + w_col1 + FOOTER_COL_GAP
+        rule_x = fx2 + w_col2 + FOOTER_COL_GAP
+        fx3 = rule_x + FOOTER_RULE_W + FOOTER_DATE_PAD_LEFT
+
+        draw.text((fx1, fl0), lbl_entry, font=font_footer_lbl, fill=MUTED)
+        draw.text((fx1, fy0), entry_txt or "—", font=font_footer_val, fill=WHITE)
+
+        draw.text((fx2, fl0), lbl_exit, font=font_footer_lbl, fill=MUTED)
+        draw.text((fx2, fy0), exit_txt or "—", font=font_footer_val, fill=WHITE)
+
+        draw.line((rule_x, fl0 - 2, rule_x, fy0 + FOOTER_VALUE_PX), fill=FOOTER_RULE_COLOR, width=FOOTER_RULE_W)
+
+        draw.text((fx3, fl0), lbl_date, font=font_footer_lbl, fill=MUTED)
+        draw.text((fx3, fy0), date_txt, font=font_footer_val, fill=WHITE)
+
+        hw = _text_width(font_handle, handle_txt)
+        draw.text((W - PAD_RIGHT - hw, H - PAD_BOTTOM - HANDLE_FONT_PX - 4), handle_txt, font=font_handle, fill=WHITE)
+
+        out = io.BytesIO()
+        out.name = "pnl-card.png"
+        card.convert("RGB").save(out, format="PNG", optimize=True)
+        out.seek(0)
+        return out
+    except Exception:
+        return None
+
 def escape_markdown_v2(text: str) -> str:
     """
     Escape special characters for Telegram MarkdownV2 parse mode.
@@ -99,6 +397,7 @@ active_market_context: Dict[int, dict] = {}
 
 # In-memory state for one-off typed inputs (e.g., setting custom signal trade amount).
 _pending_signal_amount_input: Dict[int, str] = {}  # user_id -> timeframe ("5m", "15m", or "legacy")
+_pending_signal_limit_input: Dict[int, str] = {}  # user_id -> timeframe ("5m" or "15m")
 
 # Telegram callback_data has a strict 64-byte limit. Use short aliases for
 # markets and resolve back to condition IDs server-side.
@@ -2283,6 +2582,36 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 # Show shares selection menu
                 await _render_signal_shares_menu(query.message.chat_id, context.bot, db_user, timeframe, query=query)
                 return
+            elif action == "advanced":
+                await _render_signal_advanced_menu(query.message.chat_id, context.bot, db_user, timeframe, query=query)
+                return
+            elif action == "limit" and len(parts) >= 4:
+                # Format: signals:<timeframe>:limit:<value>
+                choice = parts[3].strip().lower()
+                if choice == "custom":
+                    _pending_signal_limit_input[int(db_user["user_id"])] = timeframe
+                    await _safe_edit_message(
+                        query,
+                        f"Send max limit price for {timeframe.upper()} signals (example: `0.55`).\nAllowed range: 0.01 to 0.99.",
+                        parse_mode="Markdown",
+                    )
+                    return
+                try:
+                    limit_price = float(choice)
+                except Exception:
+                    limit_price = 0.0
+                if limit_price < 0.01 or limit_price > 0.99:
+                    await _safe_edit_message(query, "Limit price must be between 0.01 and 0.99.")
+                    return
+                col = "signal_5m_limit_price" if timeframe == "5m" else "signal_15m_limit_price"
+                with db.transaction() as conn:
+                    conn.execute(
+                        f"UPDATE users SET {col} = ? WHERE user_id = ?;",
+                        (limit_price, db_user["user_id"]),
+                    )
+                db_user = db.get_user(db_user["user_id"]) or db_user
+                await _render_signal_advanced_menu(query.message.chat_id, context.bot, db_user, timeframe, query=query)
+                return
             elif action == "amt" and len(parts) >= 4:
                 # Format: signals:<timeframe>:amt:<value>
                 choice = parts[3].strip()
@@ -2512,16 +2841,40 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                             cap = strip_emoji(caption)[:1024]
                             if photo_url.startswith("http://") or photo_url.startswith("https://"):
                                 try:
-                                    await app.bot.send_photo(
-                                        chat_id=uid,
-                                        photo=photo_url,
-                                        caption=cap,
+                                    # Pillow-only mode: generate the PNG locally
+                                    # from CARD_URL query params (no external fetch).
+                                    local_card = _build_local_pnl_card_bytes_from_url(photo_url)
+                                    if local_card is not None:
+                                        await app.bot.send_photo(
+                                            chat_id=uid,
+                                            photo=local_card,
+                                            caption=cap,
+                                        )
+                                    else:
+                                        # Last-resort fallback: send the stock background banner.
+                                        stock_banner = os.path.join(ASSETS_DIR, "pnl-card-banner.png")
+                                        await app.bot.send_photo(
+                                            chat_id=uid,
+                                            photo=stock_banner,
+                                            caption=cap,
+                                        )
+                                except Exception as e:
+                                    logger.warning(
+                                        "Card image fetch/send failed for outbox %s user=%s: %s",
+                                        oid,
+                                        uid,
+                                        e,
                                     )
-                                except Exception:
-                                    await app.bot.send_message(
-                                        chat_id=uid,
-                                        text=cap + f"\n\n(Card: {photo_url})",
-                                    )
+                                    # No-network hard fallback.
+                                    try:
+                                        stock_banner = os.path.join(ASSETS_DIR, "pnl-card-banner.png")
+                                        await app.bot.send_photo(
+                                            chat_id=uid,
+                                            photo=stock_banner,
+                                            caption=cap,
+                                        )
+                                    except Exception:
+                                        await app.bot.send_message(chat_id=uid, text=strip_emoji(rest))
                             else:
                                 await app.bot.send_message(chat_id=uid, text=strip_emoji(rest))
                         else:
@@ -2707,9 +3060,11 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
         # 5m settings
         enabled_5m = bool(db_user.get("signal_5m_enabled") or 0)
         shares_5m = int(db_user.get("signal_5m_amount_usd") or 5)
+        limit_5m = float(db_user.get("signal_5m_limit_price") or 0.55)
         # 15m settings
         enabled_15m = bool(db_user.get("signal_15m_enabled") or 0)
         shares_15m = int(db_user.get("signal_15m_amount_usd") or 5)
+        limit_15m = float(db_user.get("signal_15m_limit_price") or 0.55)
 
         status_5m = "ON ✅" if enabled_5m else "OFF ⏸"
         status_15m = "ON ✅" if enabled_15m else "OFF ⏸"
@@ -2719,12 +3074,13 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             "Configure auto-trading for different timeframes.\n\n"
             f"⏱ *5-minute signals*\n"
             f"Status: *{status_5m}*\n"
-            f"Shares per signal: *{shares_5m}*\n\n"
+            f"Shares per signal: *{shares_5m}*\n"
+            f"Limit price: *${limit_5m:.2f}*\n\n"
             f"⏱ *15-minute signals*\n"
             f"Status: *{status_15m}*\n"
-            f"Shares per signal: *{shares_15m}*\n\n"
-            "⚡ *Note:* Shares are bought at $0.55/share max.\n"
-            "Example: 10 shares = ~$5.50 USD\n\n"
+            f"Shares per signal: *{shares_15m}*\n"
+            f"Limit price: *${limit_15m:.2f}*\n\n"
+            "⚡ *Note:* Price caps are user-defined per timeframe.\n"
             "Tap a button below to configure."
         )
 
@@ -2743,6 +3099,10 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 [
                     InlineKeyboardButton("🔢 5m Shares", callback_data="signals:5m:shares"),
                     InlineKeyboardButton("🔢 15m Shares", callback_data="signals:15m:shares"),
+                ],
+                [
+                    InlineKeyboardButton("⚙️ 5m Advanced", callback_data="signals:5m:advanced"),
+                    InlineKeyboardButton("⚙️ 15m Advanced", callback_data="signals:15m:advanced"),
                 ],
                 [
                     InlineKeyboardButton("🏠 Main Menu", callback_data="home:main"),
@@ -2779,6 +3139,40 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 ],
                 [
                     InlineKeyboardButton("✍️ Custom", callback_data=f"signals:{timeframe}:amt:custom"),
+                ],
+                [
+                    InlineKeyboardButton("⬅️ Back", callback_data="signals:back"),
+                ],
+            ]
+        )
+        if query is not None:
+            await _safe_edit_message(query, text, parse_mode="Markdown", reply_markup=kb)
+        else:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", reply_markup=kb)
+
+    async def _render_signal_advanced_menu(chat_id: int, bot: Bot, db_user: dict, timeframe: str, query=None) -> None:
+        col = "signal_5m_limit_price" if timeframe == "5m" else "signal_15m_limit_price"
+        current_limit = float(db_user.get(col) or 0.55)
+        text = (
+            f"⚙️ *{timeframe.upper()} Advanced Settings*\n\n"
+            f"Current max limit price: *${current_limit:.2f}*\n\n"
+            "Choose a preset or send a custom value.\n"
+            "Allowed range: *0.01* to *0.99*"
+        )
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("$0.45", callback_data=f"signals:{timeframe}:limit:0.45"),
+                    InlineKeyboardButton("$0.50", callback_data=f"signals:{timeframe}:limit:0.50"),
+                    InlineKeyboardButton("$0.55", callback_data=f"signals:{timeframe}:limit:0.55"),
+                ],
+                [
+                    InlineKeyboardButton("$0.60", callback_data=f"signals:{timeframe}:limit:0.60"),
+                    InlineKeyboardButton("$0.65", callback_data=f"signals:{timeframe}:limit:0.65"),
+                    InlineKeyboardButton("$0.70", callback_data=f"signals:{timeframe}:limit:0.70"),
+                ],
+                [
+                    InlineKeyboardButton("✍️ Custom", callback_data=f"signals:{timeframe}:limit:custom"),
                 ],
                 [
                     InlineKeyboardButton("⬅️ Back", callback_data="signals:back"),
@@ -3991,6 +4385,28 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             await _render_signal_trading_menu(update.effective_chat.id, context.bot, db_user)
             return
 
+        # Custom limit-price input for signal trading.
+        timeframe_limit = _pending_signal_limit_input.get(int(user.id))
+        if timeframe_limit:
+            try:
+                limit_price = float(user_text.strip())
+                if limit_price < 0.01 or limit_price > 0.99:
+                    raise ValueError
+            except Exception:
+                await update.message.reply_text("Please send a valid limit price between 0.01 and 0.99.")
+                return
+
+            col = "signal_5m_limit_price" if timeframe_limit == "5m" else "signal_15m_limit_price"
+            with db.transaction() as conn:
+                conn.execute(
+                    f"UPDATE users SET {col} = ? WHERE user_id = ?;",
+                    (limit_price, int(user.id)),
+                )
+            _pending_signal_limit_input.pop(int(user.id), None)
+            db_user = db.get_user(int(user.id)) or db_user
+            await _render_signal_trading_menu(update.effective_chat.id, context.bot, db_user)
+            return
+
         # Manual follow flow: first capture wallet, then ask for risk settings.
         if context.user_data.get("awaiting_follow_wallet"):
             import re as _re
@@ -4685,7 +5101,7 @@ _Tap buttons below to trade or analyze._"""
     )
     app.add_handler(CallbackQueryHandler(handle_unfollow_callback, pattern=r"^copyunfollow:\d+$"))
     app.add_handler(CallbackQueryHandler(handle_home_callback, pattern=r"^home:(markets|copy|portfolio|wallet|smart_wallets|signals|refresh|limit_orders|referrals|settings|help|main)$"))
-    app.add_handler(CallbackQueryHandler(handle_signals_callback, pattern=r"^signals:(5m:enable|5m:disable|5m:shares|5m:amt:.+|15m:enable|15m:disable|15m:shares|15m:amt:.+|enable|disable|amt:.+|back)$"))
+    app.add_handler(CallbackQueryHandler(handle_signals_callback, pattern=r"^signals:(5m:enable|5m:disable|5m:shares|5m:advanced|5m:amt:.+|5m:limit:.+|15m:enable|15m:disable|15m:shares|15m:advanced|15m:amt:.+|15m:limit:.+|enable|disable|amt:.+|back)$"))
     app.add_handler(CallbackQueryHandler(handle_copy_callback, pattern=r"^copy:(view_more|.+)$"))
     app.add_handler(CallbackQueryHandler(handle_copyfollow_callback, pattern=r"^copyfollow:0x[a-fA-F0-9]{40}$"))
     app.add_handler(CallbackQueryHandler(handle_copyrisk_callback, pattern=r"^copyrisk:(none|cancel|[\d.]+)$"))

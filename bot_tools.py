@@ -7,6 +7,7 @@ import requests
 from web3 import Web3
 import os
 import json
+from urllib.parse import quote
 from dotenv import load_dotenv
 import market_cache
 from database_manager import DatabaseManager
@@ -109,127 +110,147 @@ def get_eth_balance(address: str) -> str:
 def _compute_polygon_balances_rpc(address: str) -> dict | None:
     """
     Compute Polygon balances via direct RPC + CoinGecko.
+
+    Uses the same ordered RPC list as CTF reads. A single bad/default endpoint
+    (rate limits, 401) previously made **every** user look empty while funds
+    remained on-chain.
     """
+    from web3.middleware import ExtraDataToPOAMiddleware
+
     try:
         checksum_address = Web3.to_checksum_address(address)
+    except Exception:
+        return None
 
-        # Pure-RPC approach: we cannot discover arbitrary ERC-20 contracts from the node,
-        # so we query a curated list of important tokens plus any extra contracts configured
-        # via environment variables.
-        ERC20_ABI = json.loads(
-            '[{"constant":true,"inputs":[{"name":"_owner","type":"address"}],'
-            '"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],'
-            '"type":"function"}]'
-        )
+    ERC20_ABI = json.loads(
+        '[{"constant":true,"inputs":[{"name":"_owner","type":"address"}],'
+        '"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],'
+        '"type":"function"}]'
+    )
 
-        TOKENS = [
-            # Circle USDC on Polygon (bridged)
-            ("USDC",  "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", 6,  "usd-coin"),
-            # Classic USDC.e on Polygon
-            ("USDC.e", "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", 6, "usd-coin"),
-            ("USDT",  "0xc2132D05D31c914a87C6611C10748AEb04B58e8F", 6,  "tether"),
-            ("WETH",  "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619", 18, "weth"),
-            ("WBTC",  "0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6", 8,  "wrapped-bitcoin"),
-            ("DAI",   "0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063", 18, "dai"),
-            ("LINK",  "0x53E0bca35eC356BD5ddDFebbD1Fc0fD03FaBad39", 18, "chainlink"),
-            ("AAVE",  "0xD6DF932A45C0f255f85145f286eA0b292B21C90B", 18, "aave"),
-            ("UNI",   "0xb33EaAd8d922B1083446DC23f610c2567fB5180f", 18, "uniswap"),
-            ("POL",   "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270", 18, "polygon-ecosystem-token"),
-        ]
+    TOKENS = [
+        ("USDC", "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", 6, "usd-coin"),
+        ("USDC.e", "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", 6, "usd-coin"),
+        ("USDT", "0xc2132D05D31c914a87C6611C10748AEb04B58e8F", 6, "tether"),
+        ("WETH", "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619", 18, "weth"),
+        ("WBTC", "0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6", 8, "wrapped-bitcoin"),
+        ("DAI", "0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063", 18, "dai"),
+        ("LINK", "0x53E0bca35eC356BD5ddDFebbD1Fc0fD03FaBad39", 18, "chainlink"),
+        ("AAVE", "0xD6DF932A45C0f255f85145f286eA0b292B21C90B", 18, "aave"),
+        ("UNI", "0xb33EaAd8d922B1083446DC23f610c2567fB5180f", 18, "uniswap"),
+        ("POL", "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270", 18, "polygon-ecosystem-token"),
+    ]
 
-        # Optional extra tokens via env: POLYGON_EXTRA_TOKENS as JSON array
-        # [{"symbol":"USDe","address":"0x...","decimals":18,"coingecko_id":"ethena-usde"}, ...]
-        extra_tokens_raw = os.getenv("POLYGON_EXTRA_TOKENS", "").strip()
-        if extra_tokens_raw:
-            try:
-                extras = json.loads(extra_tokens_raw)
-                for item in extras or []:
-                    symbol = item.get("symbol")
-                    address_hex = item.get("address")
-                    decimals = int(item.get("decimals", 18))
-                    cg_id = item.get("coingecko_id", "")
-                    if symbol and address_hex:
-                        TOKENS.append((symbol, address_hex, decimals, cg_id))
-            except Exception as e:
-                logging.error(f"Failed to parse POLYGON_EXTRA_TOKENS: {e}")
+    extra_tokens_raw = os.getenv("POLYGON_EXTRA_TOKENS", "").strip()
+    if extra_tokens_raw:
+        try:
+            extras = json.loads(extra_tokens_raw)
+            for item in extras or []:
+                symbol = item.get("symbol")
+                address_hex = item.get("address")
+                decimals = int(item.get("decimals", 18))
+                cg_id = item.get("coingecko_id", "")
+                if symbol and address_hex:
+                    TOKENS.append((symbol, address_hex, decimals, cg_id))
+        except Exception as e:
+            logging.error(f"Failed to parse POLYGON_EXTRA_TOKENS: {e}")
 
-        # Build list of all symbols we want to report (including 0 balances)
-        name_to_cg = {"POL (native)": "polygon-ecosystem-token"}
-        for name, _, _, cg_id in TOKENS:
-            name_to_cg[name] = cg_id
+    name_to_cg = {"POL (native)": "polygon-ecosystem-token"}
+    for name, _, _, cg_id in TOKENS:
+        name_to_cg[name] = cg_id
 
-        coingecko_ids = sorted({cg_id for cg_id in name_to_cg.values() if cg_id})
+    coingecko_ids = sorted({cg_id for cg_id in name_to_cg.values() if cg_id})
 
-        def _fetch_native():
-            native_wei = poly_w3.eth.get_balance(checksum_address)
-            return float(poly_w3.from_wei(native_wei, "ether"))
+    def _fetch_coingecko():
+        if not coingecko_ids:
+            return {}
+        ids_str = ",".join(coingecko_ids)
+        return _get_coingecko_prices(ids_str)
 
-        def _fetch_coingecko():
-            if not coingecko_ids:
-                return {}
-            ids_str = ",".join(coingecko_ids)
-            return _get_coingecko_prices(ids_str)
+    last_err: Exception | None = None
+    for rpc in _polygon_rpc_candidates():
+        try:
+            w3 = Web3(Web3.HTTPProvider(rpc))
+            w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
 
-        def _fetch_balance(item):
-            name, contract_addr, decimals, _cg_id = item
-            try:
-                contract = poly_w3.eth.contract(
-                    address=Web3.to_checksum_address(contract_addr),
-                    abi=ERC20_ABI,
-                )
-                raw_balance = contract.functions.balanceOf(checksum_address).call()
-                return (name, raw_balance / (10**decimals))
-            except Exception:
-                return (name, 0.0)
+            def _fetch_native():
+                native_wei = w3.eth.get_balance(checksum_address)
+                return float(w3.from_wei(native_wei, "ether"))
 
-        # Run native balance, CoinGecko, and all ERC-20 fetches in parallel
-        with ThreadPoolExecutor(max_workers=min(14, 2 + len(TOKENS))) as ex:
-            native_future = ex.submit(_fetch_native)
-            prices_future = ex.submit(_fetch_coingecko)
-            balances = dict(ex.map(_fetch_balance, TOKENS))
-            native_bal = native_future.result()
-            prices = prices_future.result()
+            def _fetch_balance(item):
+                name, contract_addr, decimals, _cg_id = item
+                try:
+                    contract = w3.eth.contract(
+                        address=Web3.to_checksum_address(contract_addr),
+                        abi=ERC20_ABI,
+                    )
+                    raw_balance = contract.functions.balanceOf(checksum_address).call()
+                    return (name, raw_balance / (10**decimals))
+                except Exception as e:
+                    logging.debug(
+                        "balanceOf failed %s token=%s rpc=%s: %s",
+                        checksum_address[:10],
+                        name,
+                        rpc[:32],
+                        e,
+                    )
+                    return (name, 0.0)
 
-        tokens_out: list[dict] = []
-        total_usd = 0.0
+            with ThreadPoolExecutor(max_workers=min(14, 2 + len(TOKENS))) as ex:
+                native_future = ex.submit(_fetch_native)
+                prices_future = ex.submit(_fetch_coingecko)
+                balances = dict(ex.map(_fetch_balance, TOKENS))
+                native_bal = native_future.result()
+                prices = prices_future.result()
 
-        # 1) Native POL (only if non-zero)
-        pol_price = prices.get("polygon-ecosystem-token", {}).get("usd", 0)
-        pol_usd = native_bal * pol_price
-        if native_bal > 0:
-            total_usd += pol_usd
-            tokens_out.append(
-                {
-                    "symbol": "POL (native)",
-                    "balance": float(native_bal),
-                    "usd_value": float(pol_usd),
-                }
-            )
+            tokens_out: list[dict] = []
+            total_usd = 0.0
 
-        # 2) ERC-20s from TOKENS
-        for name, contract_addr, decimals, _cg_id in TOKENS:
-            token_bal = balances.get(name, 0.0)
-            cg_id = name_to_cg.get(name, "")
-            usd_price = prices.get(cg_id, {}).get("usd", 0)
-            token_usd = token_bal * usd_price
-            if token_bal > 0:
-                total_usd += token_usd
+            pol_price = prices.get("polygon-ecosystem-token", {}).get("usd", 0)
+            pol_usd = native_bal * pol_price
+            if native_bal > 0:
+                total_usd += pol_usd
                 tokens_out.append(
                     {
-                        "symbol": name,
-                        "balance": float(token_bal),
-                        "usd_value": float(token_usd),
+                        "symbol": "POL (native)",
+                        "balance": float(native_bal),
+                        "usd_value": float(pol_usd),
                     }
                 )
 
-        return {
-            "wallet": checksum_address,
-            "tokens": tokens_out,
-            "total_usd": float(total_usd),
-        }
-    except Exception as e:
-        logging.error(f"Error fetching Polygon balance: {e}")
-        return None
+            for name, _contract_addr, _decimals, _cg_id in TOKENS:
+                token_bal = balances.get(name, 0.0)
+                cg_id = name_to_cg.get(name, "")
+                usd_price = prices.get(cg_id, {}).get("usd", 0)
+                token_usd = token_bal * usd_price
+                if token_bal > 0:
+                    total_usd += token_usd
+                    tokens_out.append(
+                        {
+                            "symbol": name,
+                            "balance": float(token_bal),
+                            "usd_value": float(token_usd),
+                        }
+                    )
+
+            return {
+                "wallet": checksum_address,
+                "tokens": tokens_out,
+                "total_usd": float(total_usd),
+            }
+        except Exception as e:
+            last_err = e
+            logging.warning(
+                "Polygon balance fetch failed (rpc=%s addr=%s): %s",
+                rpc[:40],
+                checksum_address[:12],
+                e,
+            )
+            continue
+
+    if last_err:
+        logging.error(f"Error fetching Polygon balance (all RPCs): {last_err}")
+    return None
 
 
 def _compute_polygon_balances(address: str) -> dict | None:
@@ -326,7 +347,121 @@ ERC20_APPROVE_ABI = json.loads('[{"constant":false,"inputs":[{"name":"_spender",
 ERC20_TRANSFER_ABI = json.loads('[{"constant":false,"inputs":[{"name":"_to","type":"address"},{"name":"_value","type":"uint256"}],"name":"transfer","outputs":[{"name":"","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"}]')
 ERC1155_APPROVAL_ABI = json.loads('[{"inputs":[{"internalType":"address","name":"operator","type":"address"},{"internalType":"bool","name":"approved","type":"bool"}],"name":"setApprovalForAll","outputs":[],"stateMutability":"nonpayable","type":"function"}]')
 CTF_REDEEM_ABI = json.loads('[{"name":"redeemPositions","type":"function","stateMutability":"nonpayable","inputs":[{"name":"collateralToken","type":"address"},{"name":"parentCollectionId","type":"bytes32"},{"name":"conditionId","type":"bytes32"},{"name":"indexSets","type":"uint256[]"}],"outputs":[]}]')
+CTF_PAYOUT_READ_ABI = json.loads(
+    '[{"inputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"name":"getOutcomeSlotCount",'
+    '"outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},'
+    '{"inputs":[{"internalType":"bytes32","name":"","type":"bytes32"},{"internalType":"uint256","name":"","type":"uint256"}],'
+    '"name":"payoutNumerators","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],'
+    '"stateMutability":"view","type":"function"},'
+    '{"inputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],'
+    '"name":"payoutDenominator","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],'
+    '"stateMutability":"view","type":"function"}]'
+)
 ZERO_COLLECTION_ID = "0x" + "0" * 64
+
+
+def _polygon_rpc_candidates() -> list[str]:
+    """Ordered RPC URLs for read-only Polygon calls (CTF resolution)."""
+    urls: list[str] = []
+    env = (os.getenv("POLYGON_RPC_URL") or "").strip()
+    if env:
+        urls.append(env)
+    for u in (
+        "https://polygon-bor.publicnode.com",
+        "https://1rpc.io/matic",
+    ):
+        if u not in urls:
+            urls.append(u)
+    return urls
+
+
+def _read_ctf_condition_payout_ratios(condition_hex: str) -> list[float] | None:
+    """
+    Read resolved payout ratios from the CTF contract (authoritative when Gamma/Data lag).
+    Returns one float per outcome slot (sums to ~1.0 when resolved); None if unresolved or error.
+    """
+    cid = _normalize_condition_id(condition_hex)
+    if not cid or len(cid) != 66:
+        return None
+    try:
+        b32 = bytes.fromhex(cid[2:])
+    except ValueError:
+        return None
+
+    from web3.middleware import ExtraDataToPOAMiddleware
+
+    for rpc in _polygon_rpc_candidates():
+        try:
+            w3 = Web3(Web3.HTTPProvider(rpc))
+            w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+            ctf = w3.eth.contract(
+                address=Web3.to_checksum_address(CTF_ADDRESS),
+                abi=CTF_PAYOUT_READ_ABI,
+            )
+            den = int(ctf.functions.payoutDenominator(b32).call())
+            if den <= 0:
+                return None
+            n = int(ctf.functions.getOutcomeSlotCount(b32).call())
+            if n <= 0:
+                return None
+            ratios: list[float] = []
+            for i in range(n):
+                num = int(ctf.functions.payoutNumerators(b32, i).call())
+                ratios.append(float(num) / float(den))
+            if not any(_payout_vector_entry_positive(x) for x in ratios):
+                return None
+            return ratios
+        except Exception as e:
+            logging.debug(
+                "CTF payout read failed (rpc=%s cond=%s): %s",
+                rpc[:28],
+                cid[:16],
+                e,
+            )
+            continue
+    return None
+
+
+def _read_ctf_condition_outcome_slot_count(condition_hex: str) -> int | None:
+    """
+    Read CTF outcome slot count if the condition is resolved on-chain.
+
+    This mirrors the Rust pre-check: only redeem when `payoutDenominator > 0`.
+    """
+    cid = _normalize_condition_id(condition_hex)
+    if not cid or len(cid) != 66:
+        return None
+    try:
+        b32 = bytes.fromhex(cid[2:])
+    except ValueError:
+        return None
+
+    for rpc in _polygon_rpc_candidates():
+        try:
+            w3 = Web3(Web3.HTTPProvider(rpc))
+            from web3.middleware import ExtraDataToPOAMiddleware
+
+            w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+            ctf = w3.eth.contract(
+                address=Web3.to_checksum_address(CTF_ADDRESS),
+                abi=CTF_PAYOUT_READ_ABI,
+            )
+            den = int(ctf.functions.payoutDenominator(b32).call())
+            if den <= 0:
+                return None
+            n = int(ctf.functions.getOutcomeSlotCount(b32).call())
+            if n <= 0:
+                return None
+            return n
+        except Exception as e:
+            logging.debug(
+                "CTF slot-count read failed (rpc=%s cond=%s): %s",
+                rpc[:28],
+                cid[:16],
+                e,
+            )
+            continue
+    return None
 
 
 def _get_builder_relay_client(private_key: str):
@@ -544,14 +679,12 @@ def withdraw_safe_to_eoa(address: str, amount: str = "all") -> str:
         _ensure_safe_deployed(client)
         resp = client.execute([tx], "Withdraw USDC.e from Safe to EOA")
         result = resp.wait()
-
-        tx_hash = ""
-        if isinstance(result, dict):
-            tx_hash = (
-                result.get("txHash")
-                or result.get("transactionHash")
-                or result.get("hash")
-                or ""
+        ok, tx_hash, err = _parse_relayer_poll_result(result, resp)
+        if not ok:
+            return (
+                "❌ Withdraw via relayer did not complete.\n"
+                f"{err or 'Unknown error'}\n"
+                f"Transaction: {tx_hash or '[unknown]'}"
             )
 
         return (
@@ -666,18 +799,58 @@ def _ensure_safe_deployed(client) -> None:
         logging.info("Safe deploy may already exist or failed softly: %s", e)
 
 
-def _fetch_closed_positions(address: str) -> list[dict]:
-    """Fetch closed/resolved Polymarket positions for an address via Data API."""
-    # Always query using the trading wallet (Safe when available).
-    trading_addr = _get_trading_wallet_address(address)
-    try:
-        url = f"https://data-api.polymarket.com/closed-positions?user={trading_addr}&limit=50"
-        resp = requests.get(url, timeout=10)
-        data = resp.json() if resp.status_code == 200 else []
-        return data if isinstance(data, list) else []
-    except Exception as e:
-        logging.error(f"Error fetching closed positions for {address}: {e}")
-        return []
+def _parse_relayer_poll_result(result, rel_resp) -> tuple[bool, str, str | None]:
+    """
+    Interpret ``ClientRelayerTransactionResponse.wait()`` return value.
+
+    The relayer polls until ``state`` is STATE_MINED / STATE_CONFIRMED (or failure).
+    The polled object is a **dict** with ``state`` and ``transactionHash`` — not
+    HTTP-style ``status``. On timeout or on-chain failure, ``wait()`` returns
+    ``None``. Treating that as “no winnings” was incorrect for redeems.
+    """
+    pending = (
+        getattr(rel_resp, "transaction_hash", None)
+        or getattr(rel_resp, "hash", None)
+        or ""
+    )
+    tid = getattr(rel_resp, "transaction_id", None) or ""
+    if result is None:
+        return (
+            False,
+            str(pending),
+            (
+                "Relayer did not confirm the transaction (timeout or failed on-chain). "
+                f"transaction_id={tid!r} submitted_hash={pending or 'none'}"
+            ),
+        )
+    if not isinstance(result, dict):
+        return (
+            False,
+            str(pending),
+            f"Unexpected relayer poll payload type: {type(result).__name__!r}",
+        )
+    tx_hash = (
+        result.get("transactionHash")
+        or result.get("txHash")
+        or result.get("hash")
+        or pending
+        or ""
+    )
+    state = (result.get("state") or "").upper()
+    if state == "STATE_FAILED":
+        return (
+            False,
+            str(tx_hash),
+            "Relayer reported STATE_FAILED (transaction reverted or dropped).",
+        )
+    if state in ("STATE_MINED", "STATE_CONFIRMED"):
+        return True, str(tx_hash), None
+    status = (result.get("status") or result.get("txStatus") or "").lower()
+    if status and status not in ("success", "succeeded", "ok", "confirmed"):
+        return False, str(tx_hash), f"Relayer status: {status!r}"
+    if tx_hash:
+        return True, str(tx_hash), None
+    return False, "", "Relayer response had no transaction hash."
 
 
 def _normalize_condition_id(cid: str) -> str:
@@ -689,30 +862,12 @@ def _normalize_condition_id(cid: str) -> str:
     return "0x" + c
 
 
-def _merge_positions_for_claim(redeemable: list, closed: list) -> list[dict]:
-    """Deduplicate by conditionId; prefer fields from redeemable list when both exist."""
-    by_cid: dict[str, dict] = {}
-    for p in (redeemable or []):
-        if not isinstance(p, dict):
-            continue
-        raw = p.get("conditionId") or p.get("condition_id") or ""
-        key = _normalize_condition_id(str(raw))
-        if key:
-            by_cid[key] = {**p, "conditionId": key}
-    for p in (closed or []):
-        if not isinstance(p, dict):
-            continue
-        raw = p.get("conditionId") or p.get("condition_id") or ""
-        key = _normalize_condition_id(str(raw))
-        if not key:
-            continue
-        if key not in by_cid:
-            by_cid[key] = {**p, "conditionId": key}
-    return list(by_cid.values())
-
-
 def _fetch_redeemable_positions(address: str) -> list[dict]:
-    """Fetch redeemable positions for a wallet via Data API."""
+    """
+    Portfolio rows that are redeemable: resolved markets where the user still holds
+    outcome tokens that can be redeemed for collateral (Data API filter).
+    Auto-claim uses only this — not generic closed positions.
+    """
     trading_addr = _get_trading_wallet_address(address)
     try:
         url = f"https://data-api.polymarket.com/positions?user={trading_addr}&redeemable=true"
@@ -724,12 +879,23 @@ def _fetch_redeemable_positions(address: str) -> list[dict]:
         return []
 
 
-def summarize_redeemable_positions_for_pnl_card(address: str) -> dict | None:
+def fetch_redeemable_positions(address: str) -> list[dict]:
+    """Public: redeemable portfolio positions for the user's trading wallet (Safe when configured)."""
+    return _fetch_redeemable_positions(address)
+
+
+def summarize_redeemable_positions_for_pnl_card(
+    address: str,
+    positions: list | None = None,
+) -> dict | None:
     """
     Aggregate redeemable position metrics for a PnL share card (before/around claim).
     Uses the user's trading wallet (Safe when configured). Returns None if nothing redeemable.
+
+    If ``positions`` is passed (e.g. from a single Data API fetch), it is used instead of refetching.
     """
-    positions = _fetch_redeemable_positions(address)
+    if positions is None:
+        positions = _fetch_redeemable_positions(address)
     if not positions:
         return None
     total_cash = 0.0
@@ -737,6 +903,14 @@ def summarize_redeemable_positions_for_pnl_card(address: str) -> dict | None:
     titles: list[str] = []
     outcomes: list[str] = []
     n = 0
+    def _pos_title(pos: dict) -> str:
+        # Data API fields are not consistent across endpoints; try several.
+        for k in ("title", "marketTitle", "question", "eventTitle"):
+            v = pos.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()[:200]
+        return ""
+
     for p in positions:
         if not isinstance(p, dict):
             continue
@@ -757,7 +931,7 @@ def summarize_redeemable_positions_for_pnl_card(address: str) -> dict | None:
             total_initial += float(p.get("initialValue") or p.get("totalBought") or 0.0)
         except (TypeError, ValueError):
             pass
-        t = (p.get("title") or "").strip()
+        t = _pos_title(p)
         if t and t not in titles:
             titles.append(t)
         o = (p.get("outcome") or "").strip()
@@ -782,7 +956,243 @@ def summarize_redeemable_positions_for_pnl_card(address: str) -> dict | None:
     }
 
 
-def _fetch_payout_info(condition_id: str) -> dict | None:
+def summarize_redeemable_positions_for_pnl_cards(
+    address: str,
+    positions: list | None = None,
+) -> list[dict] | None:
+    """
+    Build one PnL card payload per resolved market (grouped by conditionId).
+
+    This is the multi-banner version of ``summarize_redeemable_positions_for_pnl_card``.
+    """
+    if positions is None:
+        positions = _fetch_redeemable_positions(address)
+    if not positions:
+        return None
+
+    by_condition: dict[str, dict] = {}
+    order: list[str] = []
+
+    def _pos_title(pos: dict) -> str:
+        for k in ("title", "marketTitle", "question", "eventTitle"):
+            v = pos.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()[:200]
+        return ""
+
+    for p in positions:
+        if not isinstance(p, dict):
+            continue
+
+        raw = p.get("conditionId") or p.get("condition_id") or ""
+        cid = _normalize_condition_id(str(raw))
+        if not cid:
+            continue
+
+        if cid not in by_condition:
+            by_condition[cid] = {
+                "conditionId": cid,
+                "title": _pos_title(p),
+                "outcomes": set(),
+                "pnl_cash": 0.0,
+                "initial_total": 0.0,
+                # Weighted average entry price (share price in USD, 0..1 usually).
+                "entry_price_num": 0.0,
+                "entry_price_den": 0.0,
+                # Weighted average exit/mark price (prefer curPrice).
+                "exit_price_num": 0.0,
+                "exit_price_den": 0.0,
+            }
+            order.append(cid)
+
+        g = by_condition[cid]
+
+        # pnl_cash: prefer cashPnl/realizedPnl; else derive from currentValue - initialValue
+        try:
+            cp = float(p.get("cashPnl") or p.get("realizedPnl") or 0.0)
+        except (TypeError, ValueError):
+            cp = 0.0
+        if cp == 0.0:
+            try:
+                cv = float(p.get("currentValue") or 0.0)
+                iv = float(p.get("initialValue") or p.get("totalBought") or 0.0)
+                cp = cv - iv
+            except (TypeError, ValueError):
+                pass
+
+        g["pnl_cash"] += cp
+
+        try:
+            g["initial_total"] += float(p.get("initialValue") or p.get("totalBought") or 0.0)
+        except (TypeError, ValueError):
+            pass
+
+        # Avg entry price (Data API commonly provides `avgPrice` in USD per share).
+        # Weight by `size` (shares). If shares missing, fallback to weighting by dollars spent.
+        try:
+            avg_price = float(p.get("avgPrice") or 0.0)
+        except (TypeError, ValueError):
+            avg_price = 0.0
+        try:
+            shares = float(p.get("size") or 0.0)
+        except (TypeError, ValueError):
+            shares = 0.0
+        try:
+            dollars = float(p.get("initialValue") or p.get("totalBought") or 0.0)
+        except (TypeError, ValueError):
+            dollars = 0.0
+        if avg_price > 0:
+            if shares > 0:
+                g["entry_price_num"] += avg_price * shares
+                g["entry_price_den"] += shares
+            elif dollars > 0:
+                # If we only know dollars, treat avg_price as still meaningful and weight lightly by dollars.
+                g["entry_price_num"] += avg_price * dollars
+                g["entry_price_den"] += dollars
+
+        # Exit/mark price for resolved redeemable positions.
+        # Prefer `curPrice`; fallback to currentValue/size when available.
+        try:
+            exit_price = float(p.get("curPrice") or p.get("currentPrice") or 0.0)
+        except (TypeError, ValueError):
+            exit_price = 0.0
+        if exit_price <= 0 and shares > 0:
+            try:
+                cur_val = float(p.get("currentValue") or 0.0)
+                if cur_val > 0:
+                    exit_price = cur_val / shares
+            except (TypeError, ValueError):
+                pass
+        if exit_price > 0:
+            if shares > 0:
+                g["exit_price_num"] += exit_price * shares
+                g["exit_price_den"] += shares
+            elif dollars > 0:
+                g["exit_price_num"] += exit_price * dollars
+                g["exit_price_den"] += dollars
+
+        o = (p.get("outcome") or "").strip()
+        if o:
+            g["outcomes"].add(o)
+
+    payloads: list[dict] = []
+    for cid in order:
+        g = by_condition[cid]
+        total_initial = g.get("initial_total", 0.0) or 0.0
+        pnl_cash = g.get("pnl_cash", 0.0) or 0.0
+        pnl_percent = (pnl_cash / total_initial * 100.0) if total_initial > 0 else None
+
+        outcomes = sorted(list(g.get("outcomes") or []))
+        if len(outcomes) == 1:
+            outcome_label = outcomes[0][:80]
+        elif outcomes:
+            outcome_label = "Multiple outcomes"
+        else:
+            outcome_label = ""
+
+        title = (g.get("title") or "").strip()
+        if not title:
+            title = "Polymarket redemption"
+
+        entry_price = None
+        try:
+            den = float(g.get("entry_price_den") or 0.0)
+            if den > 0:
+                entry_price = float(g.get("entry_price_num") or 0.0) / den
+        except Exception:
+            entry_price = None
+
+        exit_price = None
+        try:
+            den = float(g.get("exit_price_den") or 0.0)
+            if den > 0:
+                exit_price = float(g.get("exit_price_num") or 0.0) / den
+        except Exception:
+            exit_price = None
+
+        payloads.append(
+            {
+                "conditionId": cid,
+                "title": title,
+                "outcome": outcome_label,
+                "pnl_cash": float(pnl_cash),
+                "pnl_percent": pnl_percent,
+                "position_count": len(outcomes) if outcomes else 1,
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+            }
+        )
+
+    return payloads or None
+
+
+def _coerce_json_list(val):
+    """
+    Gamma often returns ``outcomePrices`` / ``outcomes`` as a **JSON-encoded string**
+    (e.g. ``'["1", "0"]'``) rather than a real JSON array. Parse that into a Python list.
+    """
+    if val is None:
+        return None
+    if isinstance(val, list):
+        return val
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None
+        if s.startswith("["):
+            try:
+                parsed = json.loads(s)
+                return parsed if isinstance(parsed, list) else None
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
+def _normalize_market_item_payouts(item: dict) -> dict:
+    """
+    Fill ``payouts`` on a Gamma/Data market dict when possible (CTF slot order).
+    """
+    if not isinstance(item, dict):
+        return item
+    payouts_existing = item.get("payouts")
+    if isinstance(payouts_existing, list) and len(payouts_existing) > 0:
+        return item
+    coerced_p = _coerce_json_list(payouts_existing)
+    if coerced_p:
+        try:
+            return {**item, "payouts": [float(x) for x in coerced_p]}
+        except (TypeError, ValueError):
+            pass
+
+    tokens = item.get("tokens")
+    tokens_list = _coerce_json_list(tokens) if isinstance(tokens, str) else (
+        tokens if isinstance(tokens, list) else []
+    )
+    if tokens_list:
+        payouts = []
+        for t in tokens_list:
+            payouts.append(1 if isinstance(t, dict) and bool(t.get("winner")) else 0)
+        if payouts:
+            return {**item, "payouts": payouts}
+
+    # Gamma: post-resolution prices (often a JSON **string** — not a list).
+    op = item.get("outcomePrices") or item.get("outcome_prices")
+    op_list = _coerce_json_list(op)
+    if op is not None and op_list is None and isinstance(op, list):
+        op_list = op
+    if op_list:
+        try:
+            return {**item, "payouts": [float(x) for x in op_list]}
+        except (TypeError, ValueError):
+            pass
+
+    return item
+
+
+def _fetch_payout_info(
+    condition_id: str,
+    position_row: dict | None = None,
+) -> dict | None:
     """Fetch payout information for a resolved condition from Data/Gamma APIs."""
     cid = (condition_id or "").strip()
     if not cid:
@@ -791,13 +1201,29 @@ def _fetch_payout_info(condition_id: str) -> dict | None:
     if not cid.startswith("0x"):
         cid = "0x" + cid
 
-    # Try multiple known endpoints because Polymarket API shapes vary over time.
-    candidates = (
-        f"https://data-api.polymarket.com/v1/conditions?conditionIds={cid}",
-        f"https://data-api.polymarket.com/conditions?conditionIds={cid}",
+    # Gamma is the reliable source; Data ``/conditions`` paths often 404. Try Gamma first.
+    candidates: list[str] = [
         f"https://gamma-api.polymarket.com/markets?condition_ids={cid}&limit=1",
         f"https://gamma-api.polymarket.com/markets?conditionId={cid}&limit=1",
-    )
+        f"https://data-api.polymarket.com/v1/conditions?conditionIds={cid}",
+        f"https://data-api.polymarket.com/conditions?conditionIds={cid}",
+    ]
+    if position_row:
+        slug = (position_row.get("slug") or position_row.get("eventSlug") or "").strip()
+        if slug:
+            candidates.append(
+                f"https://gamma-api.polymarket.com/markets?slug={quote(slug)}&limit=1"
+            )
+
+    def _try_payload(data) -> dict | None:
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            item = _normalize_market_item_payouts(data[0])
+            p = item.get("payouts") or item.get("payout")
+            if isinstance(p, list) and len(p) > 0:
+                # Gamma often returns ["0","0"] for old/resolved rows — useless for index sets.
+                if any(_payout_vector_entry_positive(x) for x in p):
+                    return item
+        return None
 
     try:
         for url in candidates:
@@ -805,18 +1231,12 @@ def _fetch_payout_info(condition_id: str) -> dict | None:
             if resp.status_code != 200:
                 continue
             data = resp.json()
-            if isinstance(data, list) and data and isinstance(data[0], dict):
-                item = data[0]
-                # Normalize Gamma market winner fields into payout-like shape.
-                if "payouts" not in item and "tokens" in item:
-                    tokens = item.get("tokens") or []
-                    payouts = []
-                    if isinstance(tokens, list) and tokens:
-                        for t in tokens:
-                            payouts.append(1 if isinstance(t, dict) and bool(t.get("winner")) else 0)
-                    if payouts:
-                        item = {**item, "payouts": payouts}
-                return item
+            got = _try_payload(data)
+            if got is not None:
+                return got
+        ratios = _read_ctf_condition_payout_ratios(cid)
+        if ratios:
+            return {"payouts": ratios, "conditionId": cid, "resolutionSource": "ctf_chain"}
         return None
     except Exception as e:
         logging.debug(f"Error fetching payout info for {cid}: {e}")
@@ -833,26 +1253,31 @@ def _payout_vector_entry_positive(amount) -> bool:
         return False
 
 
-def _get_winning_indices(payout_info: dict) -> list[int]:
+def _get_redeem_index_sets(payout_info: dict) -> list[int]:
     """
-    Extract winning outcome indices from payout info.
-    Returns 1-indexed indices as required by redeemPositions.
+    Build CTF `redeemPositions` indexSets from Gamma/Data payout vector.
 
-    Payout vector example:
-    - [1, 0] means outcome 0 (index 1) won
-    - [0, 1] means outcome 1 (index 2) won
+    Gnosis Conditional Tokens expect **index sets** (uint256 bitmasks), not ordinal indices:
+    for outcome slot ``i`` (0-based), the singleton set is ``1 << i``.
+
+    **Up/Down, Yes/No, etc.** are only UI labels. A binary “BTC Up or Down” market still has
+    two outcome slots (index 0 and 1); the winning side is whichever slot has payout > 0 in
+    the API vector, same as any other binary market.
+
+    Multi-outcome sports: i=2 -> index set 4; i=3 -> 8; etc.
+
+    Redeem burns the user's ERC-1155 position tokens for those sets and releases collateral.
     """
     payout = payout_info.get("payouts") or payout_info.get("payout") or []
     if not payout or not isinstance(payout, list):
         return []
 
-    winning = []
+    index_sets: list[int] = []
     for i, amount in enumerate(payout):
         if _payout_vector_entry_positive(amount):
-            # Convert to 1-indexed as required by CTF
-            winning.append(i + 1)
+            index_sets.append(1 << int(i))
 
-    return winning
+    return index_sets
 
 
 # Returned when positions exist but winner/payout could not be resolved; auto-claim loop keys off this.
@@ -860,16 +1285,25 @@ AUTOCLAIM_PAYOUT_UNRESOLVED_MARK = "[autoclaim] payout winner not available"
 
 
 @mcp.tool()
-def claim_polymarket_winnings(address: str) -> str:
+def claim_polymarket_winnings(address: str, redeemable_positions: list | None = None) -> str:
     """
     Attempt to redeem winnings from resolved Polymarket markets using the
     gasless Builder relayer.
 
+    This uses the **CTF** contract `redeemPositions` (not the CLOB SDK): it burns
+    conditional tokens (ERC-1155) and returns USDC collateral for resolved
+    winning outcomes.
+
     Flow:
-    1. Fetch closed positions for the user's trading wallet
-    2. For each unique conditionId, fetch payout info to determine winner
-    3. Only redeem the winning outcome index (not both)
-    4. Submit via gasless relay to Safe wallet
+    1. Fetch **redeemable=true** positions only (resolved markets in this wallet's portfolio).
+    2. For each unique conditionId, check CTF on-chain resolution (`payoutDenominator > 0`).
+    3. Build `indexSets` from all CTF outcome slots (`1 << i`) and submit `redeemPositions(...)`.
+       If on-chain slot data is unavailable, fall back to API payout vectors.
+
+    Does not scan closed positions broadly — only Data-API-flagged redeemable portfolio rows.
+
+    Market *type* (Up/Down, Yes/No, sports multi-outcome) does not require a separate code path:
+    resolution is always expressed as a payout vector aligned with CTF outcome slot order.
     """
     db_user = db.get_user_by_address(address)
     if not db_user:
@@ -880,12 +1314,10 @@ def claim_polymarket_winnings(address: str) -> str:
     if client is None:
         return "Gasless relay is not configured on this server."
 
-    redeemable = _fetch_redeemable_positions(address)
-    closed = _fetch_closed_positions(address)
-    if redeemable:
-        source_positions = _merge_positions_for_claim(redeemable, closed)
+    if redeemable_positions is not None:
+        source_positions = redeemable_positions
     else:
-        source_positions = closed
+        source_positions = _fetch_redeemable_positions(address)
     if not source_positions:
         return "No unclaimed winnings."
 
@@ -909,15 +1341,20 @@ def claim_polymarket_winnings(address: str) -> str:
 
     for cid, pos_info in condition_payouts.items():
         try:
-            # Fetch payout info to determine winning outcome
-            payout_info = _fetch_payout_info(cid)
-            if not payout_info:
-                skipped_no_payout += 1
-                continue
+            index_sets: list[int] = []
 
-            # Get winning indices (1-indexed)
-            winning_indices = _get_winning_indices(payout_info)
-            if not winning_indices:
+            # Rust-like flow: authoritative on-chain gate + redeem all outcome slots.
+            slot_count = _read_ctf_condition_outcome_slot_count(cid)
+            if slot_count:
+                index_sets = [1 << i for i in range(slot_count)]
+
+            # Fallback for temporary RPC issues: infer winner slots from APIs.
+            if not index_sets:
+                payout_info = _fetch_payout_info(cid, pos_info)
+                if payout_info:
+                    index_sets = _get_redeem_index_sets(payout_info)
+
+            if not index_sets:
                 skipped_no_payout += 1
                 continue
 
@@ -927,10 +1364,15 @@ def claim_polymarket_winnings(address: str) -> str:
                 logging.warning(f"Skipping conditionId with invalid length: {cid}")
                 continue
 
-            # Build redeem call with only winning outcomes
+            # CTF redeemPositions: burns ERC-1155 outcome tokens for indexSets, returns collateral
             redeem_data = ctf.encode_abi(
                 "redeemPositions",
-                args=[USDC_POLYGON, ZERO_COLLECTION_ID, cid, winning_indices],
+                args=[
+                    Web3.to_checksum_address(USDC_POLYGON),
+                    ZERO_COLLECTION_ID,
+                    cid,
+                    index_sets,
+                ],
             )
             txs.append(
                 _RelayTx(
@@ -940,7 +1382,11 @@ def claim_polymarket_winnings(address: str) -> str:
                 )
             )
             claimed_count += 1
-            logging.info(f"Queued redemption for condition {cid[:16]}... winning indices: {winning_indices}")
+            logging.info(
+                "Queued redemption for condition %s... indexSets=%s",
+                cid[:16],
+                index_sets,
+            )
 
         except Exception as e:
             logging.error(f"Failed to build redeem tx for condition {cid}: {e}")
@@ -957,7 +1403,7 @@ def claim_polymarket_winnings(address: str) -> str:
             return (
                 f"{AUTOCLAIM_PAYOUT_UNRESOLVED_MARK} — Polymarket shows "
                 f"{len(condition_payouts)} resolved position(s) on your trading wallet, but the "
-                "payout API did not return a winner vector yet (or it is still syncing). "
+                "condition could not be confirmed as redeemable on-chain yet (or RPC/API data is still syncing). "
                 "You can claim from polymarket.com; auto-claim will retry on the next tick."
             )
         return "No unclaimed winnings."
@@ -967,25 +1413,12 @@ def claim_polymarket_winnings(address: str) -> str:
         _ensure_safe_deployed(client)
         resp = client.execute(txs, "Redeem Polymarket positions")
         result = resp.wait()
-
-        if not isinstance(result, dict):
-            tx_hash = getattr(resp, "transaction_hash", "") or getattr(
-                resp, "tx_hash", ""
-            )
-            logging.error(
-                "Gasless redeem via relayer returned non-dict result: %r (tx=%s)",
-                result,
-                tx_hash,
-            )
-            return "No unclaimed winnings."
-
-        tx_hash = result.get("txHash") or result.get("transactionHash") or ""
-        status = (result.get("status") or result.get("txStatus") or "").lower()
-        if status and status not in ("success", "succeeded", "ok", "confirmed"):
-            logging.error("Gasless redeem tx reported failure status: %s", status)
+        ok, tx_hash, err = _parse_relayer_poll_result(result, resp)
+        if not ok:
+            logging.error("Gasless redeem via relayer incomplete: %s", err)
             return (
-                "❌ Claim via relayer failed on-chain.\n"
-                f"Status: {status}\n"
+                "❌ Claim via relayer did not complete.\n"
+                f"{err or 'Unknown error'}\n"
                 f"Transaction: {tx_hash or '[unknown]'}"
             )
 
@@ -995,9 +1428,6 @@ def claim_polymarket_winnings(address: str) -> str:
         )
     except Exception as e:
         logging.error(f"Gasless redeem via relayer failed: {e}")
-        low = str(e).lower()
-        if "did not return a receipt" in low or "receipt" in low and "none" in low:
-            return "No unclaimed winnings."
         return f"❌ Claim via relayer failed: {str(e)}"
 
 
@@ -1075,13 +1505,38 @@ def approve_usdc_for_trading(address: str) -> str:
     usdc = w3.eth.contract(address=Web3.to_checksum_address(USDC_POLYGON), abi=ERC20_APPROVE_ABI)
     ctf = w3.eth.contract(address=Web3.to_checksum_address(CTF_ADDRESS), abi=ERC1155_APPROVAL_ABI)
 
-    # 1) USDC.approve(spender, MAX_UINT256) for all 6 contracts that pull collateral.
-    # 2) CTF.setApprovalForAll(operator, true) for all 6 so they can move ERC-1155 positions.
+    # 1) USDC.approve(spender, amount) for all contracts that pull collateral.
+    #    Keep this bounded (default 300 USDC.e) rather than unlimited approvals.
+    # 2) CTF.setApprovalForAll(operator, true) for all CTF operators so they can move ERC-1155 positions.
     txs: list[_RelayTx] = []
+
+    # Default to ~1,000,000 USDC.e allowance (bounded) to reduce repeated approvals.
+    # Set to `max` (or `unlimited`) for ERC-20 infinite approval.
+    limit_str = (os.getenv("POLYMARKET_APPROVAL_USDC_E_MAX", "1000000") or "1000000").strip().lower()
+    if limit_str in ("max", "unlimited", "infinite", "infinity"):
+        approval_amount = MAX_APPROVAL
+    else:
+        try:
+            limit_usdc_e = float(limit_str)
+            if limit_usdc_e <= 0:
+                approval_amount = MAX_APPROVAL
+            else:
+                # USDC.e is 6 decimals on Polygon
+                approval_amount = int(limit_usdc_e * 1e6)
+                approval_amount = min(approval_amount, MAX_APPROVAL)
+        except Exception:
+            approval_amount = MAX_APPROVAL
+
+    logging.info(
+        "Polymarket approvals USDC.e bounded allowance=%s (raw=%d) (env=POLYMARKET_APPROVAL_USDC_E_MAX=%r)",
+        limit_str,
+        int(approval_amount),
+        limit_str,
+    )
 
     for spender in POLYMARKET_APPROVAL_CONTRACTS:
         spender_addr = Web3.to_checksum_address(spender)
-        approve_data = usdc.encode_abi("approve", args=[spender_addr, MAX_APPROVAL])
+        approve_data = usdc.encode_abi("approve", args=[spender_addr, approval_amount])
         txs.append(
             _RelayTx(
                 to=USDC_POLYGON,
@@ -1106,28 +1561,12 @@ def approve_usdc_for_trading(address: str) -> str:
         _ensure_safe_deployed(client)
         resp = client.execute(txs, "Polymarket USDC/CTF approvals")
         result = resp.wait()
-
-        if not isinstance(result, dict):
-            tx_hash = getattr(resp, "transaction_hash", "") or getattr(
-                resp, "tx_hash", ""
-            )
-            logging.error(
-                "Gasless approvals via relayer returned non-dict result: %r (tx=%s)",
-                result,
-                tx_hash,
-            )
+        ok, tx_hash, err = _parse_relayer_poll_result(result, resp)
+        if not ok:
+            logging.error("Gasless approvals via relayer incomplete: %s", err)
             return (
-                "❌ Approval via relayer failed: transaction did not return a receipt.\n"
-                f"Transaction: {tx_hash or '[unknown]'}"
-            )
-
-        tx_hash = result.get("txHash") or result.get("transactionHash") or ""
-        status = (result.get("status") or result.get("txStatus") or "").lower()
-        if status and status not in ("success", "succeeded", "ok", "confirmed"):
-            logging.error("Gasless approval tx reported failure status: %s", status)
-            return (
-                "❌ Approval via relayer failed on-chain.\n"
-                f"Status: {status}\n"
+                "❌ Approval via relayer did not complete.\n"
+                f"{err or 'Unknown error'}\n"
                 f"Transaction: {tx_hash or '[unknown]'}"
             )
 
