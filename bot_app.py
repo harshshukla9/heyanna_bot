@@ -1407,36 +1407,12 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
 
         keyboard = InlineKeyboardMarkup(account_buttons)
         # Add a clearer account header and action hints.
-        portfolio_text = (
-            "💼 *Portfolio & Wallet*\n"
-            "Track your open positions, balances, and cashout actions in one place.\n\n"
-            + portfolio_text
-        )
-        # If we know the Safe address, append a short note so users know where to deposit.
+        wallet_lines = []
         if safe_address:
-            portfolio_text = (
-                portfolio_text
-                + "\n\n"
-                + "⚙️ *Gasless trading wallet (Safe)*\n"
-                + f"`{safe_address[:20]}...`\n"
-                + "Use this address for deposits.\n\n"
-                + "💎 *Your Wallet (EOA)*\n"
-                + f"`{address[:20]}...`\n"
-                + "Your primary wallet address."
-            )
-        else:
-            portfolio_text = (
-                portfolio_text
-                + "\n\n"
-                + "💎 *Your Wallet (EOA)*\n"
-                + f"`{address[:20]}...`\n"
-                + "Your primary wallet address."
-            )
-        portfolio_text = (
-            portfolio_text
-            + "\n\n"
-            + "Tip: Use *Deposit* to fund, *EOA → Safe* to move funds, and *Withdraw* to cash out."
-        )
+            wallet_lines.append(f"\n⚙️ *Trading wallet (Safe)*\n`{safe_address}`")
+        wallet_lines.append(f"💎 *EOA* `{address}`")
+        portfolio_text = portfolio_text + "\n" + "\n".join(wallet_lines)
+
         await _send_banner_with_caption(
             bot,
             chat_id,
@@ -1444,6 +1420,7 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             portfolio_text,
             parse_mode="Markdown",
             reply_markup=keyboard,
+            max_caption_len=1024,
         )
 
     async def _send_safe_balance(update: Update, context: ContextTypes.DEFAULT_TYPE, db_user: dict):
@@ -3919,12 +3896,18 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                 )
             if buttons:
                 keyboard = InlineKeyboardMarkup(buttons)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=portfolio_text,
-            parse_mode="Markdown",
-            reply_markup=keyboard,
-        )
+        # Telegram message limit is 4096 chars; split if portfolio is very long
+        MAX_MSG = 4096
+        if len(portfolio_text) > MAX_MSG:
+            await context.bot.send_message(chat_id=chat_id, text=portfolio_text[:MAX_MSG], parse_mode="Markdown")
+            await context.bot.send_message(chat_id=chat_id, text=portfolio_text[MAX_MSG:], reply_markup=keyboard)
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=portfolio_text,
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
 
     async def handle_portfolio_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle portfolio-related buttons from the account overview."""

@@ -1591,69 +1591,145 @@ def _fetch_positions(address: str) -> list:
         return []
 
 
+def _fetch_closed_positions(address: str) -> list:
+    """Fetch all closed positions from Polymarket Data API, paginating through all pages."""
+    trading_addr = _get_trading_wallet_address(address)
+    all_results: list = []
+    offset = 0
+    page_size = 50
+    while True:
+        try:
+            url = f"https://data-api.polymarket.com/closed-positions?user={trading_addr}&limit={page_size}&offset={offset}&sortBy=TIMESTAMP&sortDirection=DESC"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code != 200:
+                break
+            batch = resp.json()
+            if not isinstance(batch, list) or not batch:
+                break
+            all_results.extend(batch)
+            if len(batch) < page_size:
+                break
+            offset += page_size
+        except Exception as e:
+            logging.error(f"Error fetching closed positions: {e}")
+            break
+    return all_results
+
+
+def _fetch_portfolio_total_value(address: str) -> float | None:
+    """
+    Fetch total current market value of all positions using the official
+    Polymarket /value endpoint (https://data-api.polymarket.com/value?user=...).
+    Returns the value in USD, or None on failure.
+    """
+    trading_addr = _get_trading_wallet_address(address)
+    try:
+        url = f"https://data-api.polymarket.com/value?user={trading_addr}"
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, dict):
+                return float(data.get("value") or 0)
+            if isinstance(data, list) and data:
+                return float(data[0].get("value") or 0)
+    except Exception as e:
+        logging.error(f"Error fetching portfolio total value: {e}")
+    return None
+
+
 def get_polymarket_open_pnl(address: str) -> float:
     """
-    Compute total open (unrealised) PnL across all current Polymarket positions
-    for a given wallet, using the Data API.
+    Compute total open (unrealised) PnL across all current Polymarket positions.
+    Uses the /value endpoint for accurate current value, then subtracts total
+    initial investment derived from the positions endpoint.
     """
+    total_value = _fetch_portfolio_total_value(address)
     positions = _fetch_positions(address) or []
-    total_pnl = 0.0
+
+    if total_value is None:
+        # Fallback: derive from positions cashPnl
+        total_pnl = 0.0
+        for p in positions:
+            try:
+                cash_pnl = p.get("cashPnl")
+                if cash_pnl is not None:
+                    total_pnl += float(cash_pnl)
+                else:
+                    cur = float(p.get("currentValue") or 0)
+                    ini = float(p.get("initialValue") or p.get("buyPrice") or 0)
+                    total_pnl += cur - ini
+            except (TypeError, ValueError):
+                continue
+        return total_pnl
+
+    # Accurate path: total_value - total_invested
+    total_invested = 0.0
     for p in positions:
         try:
-            total_pnl += float(p.get("cashPnl", 0) or 0)
+            ini = p.get("initialValue") or p.get("buyPrice") or p.get("initialSpend")
+            if ini is not None:
+                total_invested += float(ini)
         except (TypeError, ValueError):
             continue
-    return float(total_pnl)
+    return total_value - total_invested
 
 
 @mcp.tool()
 def get_polymarket_portfolio(address: str) -> str:
     """Get a complete overview of the user's Polymarket portfolio, including funds and open positions."""
-    # Fetch balance and positions in parallel
     trading_addr = _get_trading_wallet_address(address)
-    with ThreadPoolExecutor(max_workers=2) as ex:
+    with ThreadPoolExecutor(max_workers=3) as ex:
         balance_future = ex.submit(get_polygon_balance, trading_addr)
         positions_future = ex.submit(_fetch_positions, trading_addr)
+        value_future = ex.submit(_fetch_portfolio_total_value, trading_addr)
         on_chain_summary = balance_future.result()
-        positions = positions_future.result()
-    
+        positions = positions_future.result() or []
+        total_value = value_future.result()
+
     lines = [
-        "📊 **POLYMARKET PORTFOLIO OVERVIEW**",
-        f"Wallet: `{trading_addr}`",
-        "\n💰 **On-Chain Funds**",
-        on_chain_summary.split("\n", 2)[-1] if "\n" in on_chain_summary else on_chain_summary
+        "📊 *POLYMARKET PORTFOLIO*",
+        f"Wallet: `{trading_addr[:20]}...`",
+        "\n💰 *On-Chain Funds*",
+        on_chain_summary.split("\n", 2)[-1] if "\n" in on_chain_summary else on_chain_summary,
     ]
-    
+
     if not positions:
-        lines.append("\n📈 **Open Positions**: None")
+        lines.append("\n📈 *Open Positions*: None")
     else:
-        lines.append(f"\n📈 **Open Positions ({len(positions)})**")
-        total_pnl = 0.0
-        portfolio_value = 0.0
-        
+        lines.append(f"\n📈 *Open Positions ({len(positions)})*")
+        total_invested = 0.0
+
         for p in positions:
             title = p.get("title", "Unknown Market")
             outcome = p.get("outcome", "Unknown")
-            size = float(p.get("size", 0))
-            avg_price = float(p.get("avgPrice", 0))
-            cur_price = float(p.get("curPrice", 0))
-            cur_val = float(p.get("currentValue", 0))
-            pnl_pct = float(p.get("percentPnl", 0))
-            
-            pnl_emoji = "🟢" if pnl_pct >= 0 else "🔴"
-            
+            size = float(p.get("size") or 0)
+            avg_price = float(p.get("avgPrice") or 0)
+            cur_price = float(p.get("curPrice") or 0)
+            cur_val = float(p.get("currentValue") or 0)
+            ini_val = float(p.get("initialValue") or p.get("buyPrice") or p.get("initialSpend") or 0)
+            cash_pnl = p.get("cashPnl")
+            pos_pnl = float(cash_pnl) if cash_pnl is not None else (cur_val - ini_val)
+            pnl_emoji = "🟢" if pos_pnl >= 0 else "🔴"
+            pnl_pct_str = f"{pos_pnl / ini_val * 100:+.1f}%" if ini_val > 0 else ""
+            short_title = title[:38] + "…" if len(title) > 38 else title
             lines.append(
-                f"• **{title}**\n"
-                f"  Side: {outcome} | Size: {size:.2f} shares\n"
-                f"  Buy: {avg_price*100:.1f}¢ | Now: {cur_price*100:.1f}¢ | Value: ${cur_val:.2f}\n"
-                f"  PnL: {pnl_emoji} {pnl_pct:+.2f}%"
+                f"\n▸ *{short_title}*\n"
+                f"  {outcome} · {size:.1f} shares\n"
+                f"  Avg {avg_price*100:.1f}¢ → {cur_price*100:.1f}¢ · Value ${cur_val:.2f}\n"
+                f"  {pnl_emoji} PnL ${pos_pnl:+.2f}{(' (' + pnl_pct_str + ')') if pnl_pct_str else ''}"
             )
-            total_pnl += float(p.get("cashPnl", 0))
-            portfolio_value += cur_val
+            total_invested += ini_val
 
-        lines.append(f"\n💵 **Total Portfolio Value: ${portfolio_value:.2f}**")
-        lines.append(f"{'🟢' if total_pnl >= 0 else '🔴'} **Total PnL: ${total_pnl:+.2f}**")
-    
+        portfolio_value = total_value if total_value is not None else sum(
+            float(p.get("currentValue") or 0) for p in positions
+        )
+        total_pnl = portfolio_value - total_invested
+        pnl_emoji_total = "🟢" if total_pnl >= 0 else "🔴"
+        lines.append(f"\n💵 *Total Value:* ${portfolio_value:.2f}")
+        if total_invested > 0:
+            lines.append(f"📥 *Invested:* ${total_invested:.2f}")
+        lines.append(f"{pnl_emoji_total} *Total PnL:* ${total_pnl:+.2f}")
+
     return "\n".join(lines)
 
 
@@ -1663,39 +1739,55 @@ def get_polymarket_portfolio_with_positions(address: str) -> tuple[str, list[dic
     positions: list of {condition_id, outcome, title, size, currentValue, ...}
     """
     trading_addr = _get_trading_wallet_address(address)
-    with ThreadPoolExecutor(max_workers=2) as ex:
+    with ThreadPoolExecutor(max_workers=4) as ex:
         balance_future = ex.submit(get_polygon_balance, trading_addr)
         positions_future = ex.submit(_fetch_positions, trading_addr)
+        value_future = ex.submit(_fetch_portfolio_total_value, trading_addr)
+        closed_future = ex.submit(_fetch_closed_positions, trading_addr)
         on_chain_summary = balance_future.result()
         positions = positions_future.result() or []
+        total_value = value_future.result()
+        closed_positions = closed_future.result() or []
+
+    # All-time realized PnL from closed positions
+    total_realized_pnl = 0.0
+    for cp in closed_positions:
+        try:
+            rpnl = cp.get("realizedPnl") or cp.get("cashPnl")
+            if rpnl is not None:
+                total_realized_pnl += float(rpnl)
+        except (TypeError, ValueError):
+            pass
 
     lines = [
-        "📊 **POLYMARKET PORTFOLIO OVERVIEW**",
-        f"Wallet: `{trading_addr}`",
-        "\n💰 **On-Chain Funds**",
+        "📊 *POLYMARKET PORTFOLIO*",
+        f"Wallet: `{trading_addr[:20]}...`",
+        "\n💰 *On-Chain Funds*",
         on_chain_summary.split("\n", 2)[-1] if "\n" in on_chain_summary else on_chain_summary,
     ]
 
     pos_list: list[dict] = []
     if not positions:
-        lines.append("\n📈 **Open Positions**: None")
+        lines.append("\n📈 *Open Positions*: None")
     else:
-        lines.append(f"\n📈 **Open Positions ({len(positions)})**")
-        total_pnl = 0.0
-        portfolio_value = 0.0
+        lines.append(f"\n📈 *Open Positions ({len(positions)})*")
+        total_invested = 0.0
         for p in positions:
             title = p.get("title", "Unknown Market")
             api_outcome = p.get("outcome", "Unknown")
             condition_id = p.get("conditionId") or p.get("condition_id") or ""
             asset = p.get("asset") or p.get("token_id") or ""
             outcome_index = p.get("outcomeIndex")
-            size = float(p.get("size", 0))
-            avg_price = float(p.get("avgPrice", 0))
-            cur_price = float(p.get("curPrice", 0))
-            cur_val = float(p.get("currentValue", 0))
-            pnl_pct = float(p.get("percentPnl", 0))
-            pnl_emoji = "🟢" if pnl_pct >= 0 else "🔴"
-            # Resolve to market's actual outcome name (e.g. NSH not Yes/Under) so sell uses correct token
+            size = float(p.get("size") or 0)
+            avg_price = float(p.get("avgPrice") or 0)
+            cur_price = float(p.get("curPrice") or 0)
+            cur_val = float(p.get("currentValue") or 0)
+            ini_val = float(p.get("initialValue") or p.get("buyPrice") or p.get("initialSpend") or 0)
+            cash_pnl = p.get("cashPnl")
+            pos_pnl = float(cash_pnl) if cash_pnl is not None else (cur_val - ini_val)
+            pnl_emoji = "🟢" if pos_pnl >= 0 else "🔴"
+            pnl_pct_str = f"{pos_pnl / ini_val * 100:+.1f}%" if ini_val > 0 else ""
+            # Resolve to market's actual outcome name so sell uses correct token
             outcome = api_outcome
             if condition_id:
                 m = market_cache.ensure_market_cached(condition_id)
@@ -1724,14 +1816,14 @@ def get_polymarket_portfolio_with_positions(address: str) -> tuple[str, list[dic
                         matched = next((o for o in m.outcomes if o.lower() == (api_outcome or "").lower()), None)
                         if matched:
                             outcome = matched
+            short_title = title[:38] + "…" if len(title) > 38 else title
             lines.append(
-                f"• **{title}**\n"
-                f"  Side: {outcome} | Size: {size:.2f} shares\n"
-                f"  Buy: {avg_price*100:.1f}¢ | Now: {cur_price*100:.1f}¢ | Value: ${cur_val:.2f}\n"
-                f"  PnL: {pnl_emoji} {pnl_pct:+.2f}%"
+                f"\n▸ *{short_title}*\n"
+                f"  {outcome} · {size:.1f} shares\n"
+                f"  Avg {avg_price*100:.1f}¢ → {cur_price*100:.1f}¢ · Value ${cur_val:.2f}\n"
+                f"  {pnl_emoji} PnL ${pos_pnl:+.2f}{(' (' + pnl_pct_str + ')') if pnl_pct_str else ''}"
             )
-            total_pnl += float(p.get("cashPnl", 0))
-            portfolio_value += cur_val
+            total_invested += ini_val
             pos_list.append({
                 "condition_id": condition_id,
                 "outcome": outcome,
@@ -1740,8 +1832,20 @@ def get_polymarket_portfolio_with_positions(address: str) -> tuple[str, list[dic
                 "cur_price": cur_price,
                 "current_value": cur_val,
             })
-        lines.append(f"\n💵 **Total Portfolio Value: ${portfolio_value:.2f}**")
-        lines.append(f"{'🟢' if total_pnl >= 0 else '🔴'} **Total PnL: ${total_pnl:+.2f}**")
+
+        portfolio_value = total_value if total_value is not None else sum(
+            float(p.get("currentValue") or 0) for p in positions
+        )
+        unrealized_pnl = portfolio_value - total_invested
+        all_time_pnl = unrealized_pnl + total_realized_pnl
+        pnl_emoji_open = "🟢" if unrealized_pnl >= 0 else "🔴"
+        pnl_emoji_all = "🟢" if all_time_pnl >= 0 else "🔴"
+        lines.append(f"\n💵 *Open Value:* ${portfolio_value:.2f}")
+        if total_invested > 0:
+            lines.append(f"  {pnl_emoji_open} Unrealized: ${unrealized_pnl:+.2f}")
+        if total_realized_pnl != 0 or closed_positions:
+            lines.append(f"  {'🟢' if total_realized_pnl >= 0 else '🔴'} Realized: ${total_realized_pnl:+.2f} ({len(closed_positions)} closed)")
+        lines.append(f"{pnl_emoji_all} *All-Time PnL:* ${all_time_pnl:+.2f}")
 
     return "\n".join(lines), pos_list
 

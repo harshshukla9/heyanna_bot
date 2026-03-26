@@ -651,12 +651,22 @@ def _fetch_positions_sync(addr: str) -> list:
 
 
 def _fetch_closed_positions_sync(addr: str) -> list:
-    """Sync fetch of Polymarket closed positions for one address (cached)."""
-    data = _fetch_url(
-        f"https://data-api.polymarket.com/closed-positions?user={addr}&limit=50",
-        timeout=10,
-    )
-    return data if isinstance(data, list) else []
+    """Sync fetch of ALL Polymarket closed positions for one address, paginating until exhausted."""
+    all_results: list = []
+    offset = 0
+    page_size = 50
+    while True:
+        data = _fetch_url(
+            f"https://data-api.polymarket.com/closed-positions?user={addr}&limit={page_size}&offset={offset}&sortBy=TIMESTAMP&sortDirection=DESC",
+            timeout=10,
+        )
+        if not isinstance(data, list) or not data:
+            break
+        all_results.extend(data)
+        if len(data) < page_size:
+            break
+        offset += page_size
+    return all_results
 
 
 def _fetch_public_profile_sync(
@@ -1068,11 +1078,13 @@ def _build_portfolio_from_fetched(
     balance_json: Dict[str, Any],
     positions_raw: list,
     closed_raw: list,
+    total_value_override: float | None = None,
 ) -> Dict[str, Any]:
     """Build portfolio dict from pre-fetched balance, positions, and closed positions."""
     positions_json: list[Dict[str, Any]] = []
     markets_map: Dict[str, Dict[str, Any]] = {}
-    total_pnl = 0.0
+    total_unrealized_pnl = 0.0
+    total_invested = 0.0
     portfolio_value = 0.0
 
     for p in positions_raw:
@@ -1084,8 +1096,11 @@ def _build_portfolio_from_fetched(
             avg_price = float(p.get("avgPrice", 0) or 0)
             cur_price = float(p.get("curPrice", 0) or 0)
             cur_val = float(p.get("currentValue", 0) or 0)
-            pnl_pct = float(p.get("percentPnl", 0) or 0)
-            cash_pnl = float(p.get("cashPnl", 0) or 0)
+            ini_val = float(p.get("initialValue", 0) or p.get("buyPrice", 0) or p.get("initialSpend", 0) or 0)
+            # Derive PnL accurately — cashPnl is often null from the API
+            raw_cash_pnl = p.get("cashPnl")
+            cash_pnl = float(raw_cash_pnl) if raw_cash_pnl is not None else (cur_val - ini_val)
+            pnl_pct = (cash_pnl / ini_val * 100.0) if ini_val > 0 else float(p.get("percentPnl", 0) or 0)
         except (TypeError, ValueError):
             continue
 
@@ -1098,11 +1113,13 @@ def _build_portfolio_from_fetched(
                 "avg_price": avg_price,
                 "current_price": cur_price,
                 "current_value": cur_val,
+                "initial_value": ini_val,
                 "pnl_percent": pnl_pct,
                 "pnl_cash": cash_pnl,
             }
         )
-        total_pnl += cash_pnl
+        total_unrealized_pnl += cash_pnl
+        total_invested += ini_val
         portfolio_value += cur_val
 
         market_key = condition_id or title
@@ -1167,13 +1184,18 @@ def _build_portfolio_from_fetched(
         except (TypeError, ValueError):
             continue
 
-    total_pnl_all = total_pnl + closed_pnl
+    # Use /value endpoint total if provided (more accurate than summing currentValue)
+    effective_portfolio_value = total_value_override if total_value_override is not None else portfolio_value
+    # Recalculate unrealized PnL using accurate total value
+    total_unrealized_pnl = effective_portfolio_value - total_invested if total_invested > 0 else total_unrealized_pnl
+    total_pnl_all = total_unrealized_pnl + closed_pnl
     closed_count = len(closed_positions)
     open_count = len(positions_json)
     win_rate = (win_count / closed_count * 100.0) if closed_count > 0 else None
 
     return {
         "wallet": addr,
+        "total_pnl": total_pnl_all,
         "on_chain_summary": strip_emoji(on_chain_summary),
         "balance": balance_json,
         "positions": positions_json,
@@ -1183,17 +1205,19 @@ def _build_portfolio_from_fetched(
             "open_positions_count": open_count,
             "closed_positions_count": closed_count,
             "total_realized_pnl": closed_pnl,
-            "total_unrealized_pnl": total_pnl,
+            "total_unrealized_pnl": total_unrealized_pnl,
             "total_pnl_all": total_pnl_all,
-            "portfolio_value": portfolio_value,
+            "portfolio_value": effective_portfolio_value,
+            "total_invested": total_invested,
             "win_count": win_count,
             "loss_count": loss_count,
             "win_rate_percent": win_rate,
         },
         "totals": {
-            "portfolio_value": portfolio_value,
-            "total_pnl": total_pnl,
-            "closed_pnl": closed_pnl,
+            "portfolio_value": effective_portfolio_value,
+            "total_invested": total_invested,
+            "total_unrealized_pnl": total_unrealized_pnl,
+            "total_realized_pnl": closed_pnl,
             "total_pnl_all": total_pnl_all,
         },
     }
@@ -4126,13 +4150,22 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
         # Use trading wallet (Safe when available) for portfolio, positions and trades.
         address = get_trading_wallet_address(user["eth_address"])
 
-        # Fetch balance, positions, closed positions, and PM trades in parallel (single balance fetch)
-        balance_json, positions_raw, closed_raw, pm_trades = await asyncio.gather(
+        # Fetch everything in parallel including /value endpoint for accurate open PnL
+        balance_json, positions_raw, closed_raw, pm_trades, total_value_raw = await asyncio.gather(
             asyncio.to_thread(_get_balance_json_cached, address),
             asyncio.to_thread(_fetch_positions_sync, address),
             asyncio.to_thread(_fetch_closed_positions_sync, address),
             asyncio.to_thread(_fetch_pm_trades_sync, address),
+            asyncio.to_thread(
+                lambda: _fetch_url(f"https://data-api.polymarket.com/value?user={address}", timeout=10)
+            ),
         )
+        if isinstance(total_value_raw, list) and total_value_raw:
+            total_value_override = float(total_value_raw[0].get("value") or 0)
+        elif isinstance(total_value_raw, dict):
+            total_value_override = float(total_value_raw.get("value") or 0)
+        else:
+            total_value_override = None
         on_chain_summary = _format_balance_json_as_summary(balance_json or {})
         portfolio = _build_portfolio_from_fetched(
             address,
@@ -4140,6 +4173,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
             balance_json or {},
             positions_raw or [],
             closed_raw or [],
+            total_value_override=total_value_override,
         )
 
         def _has_valid_tx(t: Dict[str, Any]) -> bool:
@@ -4223,12 +4257,21 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
             raise HTTPException(status_code=400, detail="Address is required.")
 
         # Fetch in parallel (same pattern as /me/portfolio)
-        balance_json, positions_raw, closed_raw, pm_trades_user = await asyncio.gather(
+        balance_json, positions_raw, closed_raw, pm_trades_user, total_value_raw2 = await asyncio.gather(
             asyncio.to_thread(_get_balance_json_cached, address),
             asyncio.to_thread(_fetch_positions_sync, address),
             asyncio.to_thread(_fetch_closed_positions_sync, address),
             asyncio.to_thread(_fetch_pm_trades_sync, address),
+            asyncio.to_thread(
+                lambda: _fetch_url(f"https://data-api.polymarket.com/value?user={address}", timeout=10)
+            ),
         )
+        if isinstance(total_value_raw2, list) and total_value_raw2:
+            total_value_override2 = float(total_value_raw2[0].get("value") or 0)
+        elif isinstance(total_value_raw2, dict):
+            total_value_override2 = float(total_value_raw2.get("value") or 0)
+        else:
+            total_value_override2 = None
         on_chain_summary = _format_balance_json_as_summary(balance_json or {})
         portfolio = _build_portfolio_from_fetched(
             address,
@@ -4236,6 +4279,7 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
             balance_json or {},
             positions_raw or [],
             closed_raw or [],
+            total_value_override=total_value_override2,
         )
 
         def _has_valid_tx(t: Dict[str, Any]) -> bool:
