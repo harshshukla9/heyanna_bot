@@ -80,6 +80,21 @@ htmlcov/
 Thumbs.db
 
 # -----------------------------
+# Telethon / Telegram sessions
+# -----------------------------
+*.session
+*.session-journal
+
+# -----------------------------
+# JSON output / scratch files
+# -----------------------------
+a.json
+*.json
+!package.json
+!package-lock.json
+!pyproject.toml
+
+# -----------------------------
 # Local agent/tooling directories
 # -----------------------------
 .agents/
@@ -87,6 +102,7 @@ Thumbs.db
 .clude/
 agents/
 poly-agents/
+polymarket-cli/
 
 # -----------------------------
 # Redundant local docs
@@ -96,3 +112,9 @@ INTEGRATION.md
 PROGRAMMABLE_HOOKS.md
 doc.md
 *.ipynb
+
+# -----------------------------
+# Generated assets / test output
+# -----------------------------
+assets/pnl-card-pillow-test.png
+scripts/test_pnl_card_pillow.py

@@ -14,6 +14,9 @@ from typing import Any, Dict, Mapping
 from urllib.parse import parse_qsl, quote, urlencode
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Persistent thread pool for signal trades — avoids creation/teardown overhead per signal.
+_SIGNAL_TRADE_EXECUTOR = ThreadPoolExecutor(max_workers=32, thread_name_prefix="sig-trade")
+
 import jwt
 import requests
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -1649,35 +1652,42 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                     enabled_col = "signal_5m_enabled"
                     amount_col = "signal_5m_amount_usd"
                     limit_col = "signal_5m_limit_price"
+                    fok_col = "signal_5m_use_fok"
                 elif timeframe == "15m":
                     enabled_col = "signal_15m_enabled"
                     amount_col = "signal_15m_amount_usd"
                     limit_col = "signal_15m_limit_price"
+                    fok_col = "signal_15m_use_fok"
                 else:
                     # Default to legacy settings
                     enabled_col = "signal_trading_enabled"
                     amount_col = "signal_trade_amount_usd"
                     limit_col = None
+                    fok_col = None
 
                 select_limit = f", {limit_col}" if limit_col else ""
+                select_fok = f", {fok_col}" if fok_col else ""
                 rows = db.execute(
-                    f"SELECT user_id, {amount_col}{select_limit} FROM users WHERE {enabled_col} = 1 AND COALESCE({amount_col}, 0) > 0;"
+                    f"SELECT user_id, {amount_col}{select_limit}{select_fok} FROM users WHERE {enabled_col} = 1 AND COALESCE({amount_col}, 0) > 0;"
                 ).fetchall()
 
                 if not rows:
                     return
 
-                # Prepare user tasks
+                # Prepare user tasks: (uid, amount_usd, limit_price, use_limit_orders)
                 user_tasks = []
                 for r in rows:
                     uid = int(r["user_id"])
                     amount_usd = float(r[amount_col] or 0.0)
-                    limit_price = float(r[limit_col] or LIMIT_ORDER_PRICE) if limit_col else LIMIT_ORDER_PRICE
+                    use_fok = bool(r[fok_col] or 0) if fok_col else False
+                    # FOK mode = market orders (not limit); limit mode = GTC limit orders
+                    use_limit_orders_for_user = not use_fok
+                    limit_price = float(r[limit_col] or LIMIT_ORDER_PRICE) if limit_col and not use_fok else LIMIT_ORDER_PRICE
                     if limit_price < 0.01 or limit_price > 0.99:
                         limit_price = LIMIT_ORDER_PRICE
                     if amount_usd <= 0:
                         continue
-                    user_tasks.append((uid, amount_usd, limit_price))
+                    user_tasks.append((uid, amount_usd, limit_price, use_limit_orders_for_user))
 
                 if not user_tasks:
                     return
@@ -1697,19 +1707,57 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                     "source": src,
                 }
 
-                # Execute trades for all users in parallel using thread pool
-                with ThreadPoolExecutor(max_workers=len(user_tasks)) as executor:
-                    futures = {
-                        executor.submit(_trade_for_user, db, uid, amt, signal_dict, USE_LIMIT_ORDERS, lpx): uid
-                        for uid, amt, lpx in user_tasks
-                    }
-
-                    for future in as_completed(futures):
-                        uid, traded, result = future.result()
-                        if traded:
-                            logging.getLogger(__name__).info(f"[autotrader:{uid}] Trade executed: {result[:100]}...")
+                # Pre-warm both caches BEFORE spawning threads so every thread gets instant hits.
+                _prewarm_condition_id = None
+                try:
+                    import market_cache as _market_cache
+                    from autotrader_manager import (
+                        TIMEFRAME_TO_SERIES as _TF_SERIES,
+                        TIMEFRAME_INTERVAL_SECONDS as _TF_INTERVALS,
+                        _MARKET_RESOLUTION_CACHE,
+                        _MARKET_RESOLUTION_CACHE_LOCK,
+                    )
+                    _series = _TF_SERIES.get(timeframe)
+                    if _series:
+                        _interval = _TF_INTERVALS.get(timeframe, 300)
+                        _window = (int(time.time()) // _interval) * _interval
+                        _ck = (_series, _window)
+                        with _MARKET_RESOLUTION_CACHE_LOCK:
+                            _cached_entry = _MARKET_RESOLUTION_CACHE.get(_ck)
+                        if _cached_entry:
+                            _prewarm_condition_id = _cached_entry[0]
                         else:
-                            logging.getLogger(__name__).info(f"[autotrader:{uid}] Signal skipped: {result}")
+                            _resolved = _resolve_latest_event_for_series_slug(
+                                _series, max_events=2000, page_size=200, active_only=False
+                            )
+                            _prewarm_condition_id = _resolved.condition_id
+                            with _MARKET_RESOLUTION_CACHE_LOCK:
+                                if len(_MARKET_RESOLUTION_CACHE) >= 10:
+                                    del _MARKET_RESOLUTION_CACHE[next(iter(_MARKET_RESOLUTION_CACHE))]
+                                _MARKET_RESOLUTION_CACHE[_ck] = (_resolved.condition_id, _resolved.event_slug)
+                            logging.getLogger(__name__).info(
+                                f"[autotrader] Resolved market: {_series} -> {_prewarm_condition_id[:16]}..."
+                            )
+                        # Also warm the CLOB market cache so threads skip that HTTP call too.
+                        if _prewarm_condition_id and not _market_cache.get_by_condition_id(_prewarm_condition_id):
+                            _market_cache.ensure_market_cached(_prewarm_condition_id)
+                            logging.getLogger(__name__).info(
+                                f"[autotrader] CLOB market cached: {_prewarm_condition_id[:16]}..."
+                            )
+                except Exception as _pre_warm_err:
+                    logging.getLogger(__name__).warning(f"[autotrader] Pre-warm failed: {_pre_warm_err}")
+
+                # Submit all user trades to the persistent thread pool (no teardown overhead).
+                futures = {
+                    _SIGNAL_TRADE_EXECUTOR.submit(_trade_for_user, db, uid, amt, signal_dict, use_lmt, lpx): uid
+                    for uid, amt, lpx, use_lmt in user_tasks
+                }
+                for future in as_completed(futures):
+                    uid, traded, result = future.result()
+                    if traded:
+                        logging.getLogger(__name__).info(f"[autotrader:{uid}] Trade executed: {result[:100]}...")
+                    else:
+                        logging.getLogger(__name__).info(f"[autotrader:{uid}] Signal skipped: {result}")
 
             except Exception as e:
                 logging.getLogger(__name__).error(f"[autotrader] Error: {e}")
@@ -1845,41 +1893,33 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                                         "pnl_percent": None,
                                     }
                                 ]
-                            key = f"success:{result_norm}"
                             outbox_enqueued = False
-                            if _last_auto_claim_status.get(uid) != key:
-                                _last_auto_claim_status[uid] = key
-                                for payload in payloads:
-                                    card_url = _build_pnl_card_image_url(
-                                        payload,
-                                        user_id=uid,
-                                        wallet_masked=_mask_wallet(addr),
-                                    )
-                                    market_label = (payload.get("title") or "Market").strip()
-                                    est_cash = float(payload.get("pnl_cash") or 0)
-                                    est_pct = payload.get("pnl_percent")
-                                    msg_body = (
-                                        "🏆 Auto-claim submitted\n"
-                                        f"Market: {market_label}\n"
-                                        f"Est. PnL: ${est_cash:+.2f}"
-                                        + (
-                                            f" ({float(est_pct):+.2f}%)"
-                                            if est_pct is not None
-                                            else ""
-                                        )
-                                        + "\n"
-                                        + result_norm
-                                    )
-                                    if card_url:
-                                        out_text = f"CARD_URL:{card_url}\n{msg_body}"
-                                    else:
-                                        out_text = msg_body
-                                    await _enqueue_outbox(
-                                        uid,
-                                        "signal_winnings_claim_submitted",
-                                        out_text,
-                                    )
-                                    outbox_enqueued = True
+                            for payload in payloads:
+                                # Dedup per-position by conditionId so every market gets a card.
+                                cid_key = str(payload.get("conditionId") or payload.get("condition_id") or "")
+                                pos_key = f"submitted:{uid}:{cid_key or result_norm[:80]}"
+                                if _last_auto_claim_status.get(pos_key):
+                                    continue
+                                _last_auto_claim_status[pos_key] = True
+                                market_label = (payload.get("title") or "Market").strip()
+                                est_cash = float(payload.get("pnl_cash") or 0)
+                                est_pct = payload.get("pnl_percent")
+                                msg_body = (
+                                    "🏆 Auto-claim submitted\n"
+                                    f"Market: {market_label}\n"
+                                    f"Est. PnL: ${est_cash:+.2f}"
+                                    + (f" ({float(est_pct):+.2f}%)" if est_pct is not None else "")
+                                    + "\n" + result_norm
+                                )
+                                card_payload = {
+                                    k: payload.get(k)
+                                    for k in ("title", "outcome", "pnl_cash", "pnl_percent",
+                                              "entry_price", "exit_price")
+                                }
+                                import json as _json
+                                out_text = f"CARD_JSON:{_json.dumps(card_payload)}\n{msg_body}"
+                                await _enqueue_outbox(uid, "signal_winnings_claim_submitted", out_text)
+                                outbox_enqueued = True
                             _append_logs_text(
                                 "auto_claim.log",
                                 f"submit user_id={uid} wallet={_mask_wallet(addr)} "
@@ -1918,49 +1958,43 @@ def create_api_app(db: DatabaseManager) -> FastAPI:
                                         "pnl_percent": None,
                                     }
                                 ]
-                            # Dedup key per user per tick: stable marker + aggregated PnL.
-                            first_payload = payloads[0] if payloads else {}
-                            key = f"open_polymarket:{float(first_payload.get('pnl_cash') or 0):.2f}:{first_payload.get('pnl_percent')}"
                             outbox_enqueued = False
-                            if _last_auto_claim_status.get(uid) != key:
-                                _last_auto_claim_status[uid] = key
-                                for payload in payloads:
-                                    card_url = _build_pnl_card_image_url(
-                                        payload,
-                                        user_id=uid,
-                                        wallet_masked=_mask_wallet(addr),
+                            for payload in payloads:
+                                cid_key = str(payload.get("conditionId") or payload.get("condition_id") or "")
+                                pos_key = f"open_polymarket:{uid}:{cid_key or (str(payload.get('pnl_cash') or '') + str(payload.get('title') or ''))[:80]}"
+                                if _last_auto_claim_status.get(pos_key):
+                                    continue
+                                _last_auto_claim_status[pos_key] = True
+                                market_label = (payload.get("title") or "Market").strip()
+                                est_cash = float(payload.get("pnl_cash") or 0)
+                                est_pct = payload.get("pnl_percent")
+                                msg_body = (
+                                    "🏆 Redeem on Polymarket\n"
+                                    f"Market: {market_label}\n"
+                                    f"Est. PnL: ${est_cash:+.2f}"
+                                    + (
+                                        f" ({float(est_pct):+.2f}%)"
+                                        if est_pct is not None
+                                        else ""
                                     )
-                                    market_label = (payload.get("title") or "Market").strip()
-                                    est_cash = float(payload.get("pnl_cash") or 0)
-                                    est_pct = payload.get("pnl_percent")
-                                    msg_body = (
-                                        "🏆 Redeem on Polymarket\n"
-                                        f"Market: {market_label}\n"
-                                        f"Est. PnL: ${est_cash:+.2f}"
-                                        + (
-                                            f" ({float(est_pct):+.2f}%)"
-                                            if est_pct is not None
-                                            else ""
-                                        )
-                                        + "\n"
-                                        + "Open Polymarket to redeem your resolved winnings."
-                                    )
-                                    if card_url:
-                                        out_text = f"CARD_URL:{card_url}\n{msg_body}"
-                                    else:
-                                        out_text = msg_body
-                                    await _enqueue_outbox(
-                                        uid,
-                                        "signal_winnings_redeem_open_polymarket",
-                                        out_text,
-                                    )
-                                    outbox_enqueued = True
+                                    + "\n"
+                                    + "Open Polymarket to redeem your resolved winnings."
+                                )
+                                import json as _json
+                                card_payload = {k: payload.get(k) for k in ("title", "outcome", "pnl_cash", "pnl_percent", "entry_price", "exit_price")}
+                                out_text = f"CARD_JSON:{_json.dumps(card_payload)}\n{msg_body}"
+                                await _enqueue_outbox(
+                                    uid,
+                                    "signal_winnings_redeem_open_polymarket",
+                                    out_text,
+                                )
+                                outbox_enqueued = True
                             _append_logs_text(
                                 "auto_claim.log",
                                 f"open_polymarket user_id={uid} wallet={_mask_wallet(addr)} "
                                 f"est_pnl=<multi> "
                                 f"outbox={'yes' if outbox_enqueued else 'deduped'} "
-                                f"card_url={'yes' if outbox_enqueued else 'no'}",
+                                f"card_json=yes",
                             )
                             _append_logs_jsonl(
                                 "auto_claim.jsonl",

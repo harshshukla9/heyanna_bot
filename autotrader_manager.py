@@ -53,6 +53,26 @@ USE_LIMIT_ORDERS = True
 LIMIT_ORDER_PRICE = 0.55  # Max price per share
 MIN_ORDER_SHARES = 5  # Polymarket minimum order size
 
+# Module-level market resolution cache: (series_slug, window_ts) -> (condition_id, event_slug)
+# Avoids repeated Gamma API calls for the same 5m/15m window across users and signals.
+_MARKET_RESOLUTION_CACHE: dict[tuple[str, int], tuple[str, str]] = {}
+_MARKET_RESOLUTION_CACHE_LOCK = __import__("threading").Lock()
+
+TIMEFRAME_INTERVAL_SECONDS = {
+    "1m": 60,
+    "5m": 300,
+    "15m": 900,
+    "30m": 1800,
+    "1h": 3600,
+}
+
+# Cache loggers per user to avoid recreating FileHandlers on every AutoTraderManager init.
+_USER_ORDER_LOGGERS: dict[int, logging.Logger] = {}
+
+# Flag: traded_condition_ids table is created once per process, not on every init.
+_TRADED_TABLE_CREATED = False
+_TRADED_TABLE_LOCK = __import__("threading").Lock()
+
 
 @dataclass
 class SignalState:
@@ -126,22 +146,49 @@ class AutoTraderManager:
         self._setup_order_logger()
 
     def _setup_order_logger(self) -> None:
-        """Setup order logging to file."""
+        """Setup order logging to file. Logger is cached per user_id to avoid re-opening file handles."""
+        if self.user_id in _USER_ORDER_LOGGERS:
+            self.order_logger = _USER_ORDER_LOGGERS[self.user_id]
+            return
+
         LOGS_DIR = Path(__file__).parent / "logs"
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
         ORDER_LOG_FILE = LOGS_DIR / "autotrader_orders.jsonl"
 
-        self.order_logger = logging.getLogger(f"autotrader_{self.user_id}")
-        self.order_logger.setLevel(logging.INFO)
-        self.order_logger.propagate = False
-
-        # Remove existing handlers to avoid duplicates
-        self.order_logger.handlers = []
-
+        lg = logging.getLogger(f"autotrader_{self.user_id}")
+        lg.setLevel(logging.INFO)
+        lg.propagate = False
+        lg.handlers = []
         fh = logging.FileHandler(ORDER_LOG_FILE, mode='a')
         fh.setLevel(logging.INFO)
         fh.setFormatter(logging.Formatter('%(message)s'))
-        self.order_logger.addHandler(fh)
+        lg.addHandler(fh)
+
+        _USER_ORDER_LOGGERS[self.user_id] = lg
+        self.order_logger = lg
+
+    def _enqueue_notification(self, chat_id: int, message: str) -> None:
+        """
+        Write notification to signal_notifications_outbox (fast DB insert).
+        The bot's outbox delivery loop picks it up and sends via Telegram async.
+        Falls back to direct HTTP only if DB write fails.
+        """
+        if not self.send_notification:
+            return
+        try:
+            now_ts = int(time.time())
+            self.db.execute(
+                """
+                INSERT INTO signal_notifications_outbox (user_id, kind, text, created_at, sent_at)
+                VALUES (?, ?, ?, ?, NULL);
+                """,
+                (chat_id, "signal_trade_notification", message, now_ts),
+            )
+            return
+        except Exception as e:
+            logger.warning(f"[autotrader:{self.user_id}] Outbox enqueue failed, falling back to direct HTTP: {e}")
+        # Fallback: direct sync HTTP (slower but ensures delivery)
+        self._send_telegram_notification(chat_id, message)
 
     def _send_telegram_notification(self, chat_id: int, message: str) -> None:
         """Send a Telegram notification to the user."""
@@ -179,48 +226,116 @@ class AutoTraderManager:
         amount: float = None,
         price: float = None,
         timeframe: str = None,
+        is_limit_order: bool = True,
     ) -> None:
         """Send a Telegram notification about a signal trade execution."""
         if not self.send_notification or not self.bot_token:
             return
 
-        # user_id is the Telegram user ID which can be used as chat_id
         chat_id = self.user_id
-
-        # Build notification message
         timeframe_str = f" ({timeframe.upper()})" if timeframe else ""
-        order_type_str = f" @ ${price:.2f}/share" if price else ""
-        size_str = f"{shares} shares" if shares else f"${amount:.2f}"
+        direction = "UP" if signal_side.upper() == "YES" else ("DOWN" if signal_side.upper() == "NO" else signal_side.upper())
 
-        if price:
-            total_value = shares * price
-            size_str = f"{shares} shares ({total_value:.2f} USD)"
+        if is_limit_order and price is not None:
+            total_value = (shares or 0) * price
+            size_str = f"{shares} shares ({total_value:.2f} USD) @ ${price:.2f}/share"
+            message = (
+                f"📋 *Limit Order Placed*{timeframe_str}\n\n"
+                f"Direction: *{direction}*\n"
+                f"Market: *{condition_id[:40]}...*\n"
+                f"Size: *{size_str}*\n\n"
+                f"Order is resting on the book — you'll be notified when it fills ✅"
+            )
+        else:
+            size_str = f"${amount:.2f}" if amount else f"{shares} shares"
+            message = (
+                f"⚡ *Market Order Executed*{timeframe_str}\n\n"
+                f"Direction: *{direction}*\n"
+                f"Market: *{condition_id[:40]}...*\n"
+                f"Size: *{size_str}*\n\n"
+                f"Trade executed immediately ✅"
+            )
 
-        message = (
-            f"📡 *Signal Trade Executed*{timeframe_str}\n\n"
-            f"Direction: *{signal_side}*\n"
-            f"Market: *{condition_id[:40]}...*\n"
-            f"Size: *{size_str}*{order_type_str}\n\n"
-            f"Trade placed successfully ✅"
-        )
+        self._enqueue_notification(chat_id, message)
 
-        self._send_telegram_notification(chat_id, message)
+    def _send_limit_order_fill_notification(
+        self,
+        condition_id: str,
+        side: str,
+        price: float,
+        size: float,
+        timeframe: str | None,
+        filled: bool,
+        reason: str | None = None,
+    ) -> None:
+        """Send a notification when a tracked limit order is filled or cancelled."""
+        if not self.send_notification or not self.bot_token:
+            return
+        chat_id = self.user_id
+        direction = "UP" if side.upper() in ("YES", "UP") else ("DOWN" if side.upper() in ("NO", "DOWN") else side.upper())
+        timeframe_str = f" ({timeframe.upper()})" if timeframe else ""
+        if filled:
+            message = (
+                f"✅ *Limit Order Filled*{timeframe_str}\n\n"
+                f"Direction: *{direction}*\n"
+                f"Market: *{condition_id[:40]}...*\n"
+                f"Filled: *{size} shares @ ${price:.2f}/share*"
+            )
+        else:
+            reason_str = f"\nReason: {reason}" if reason else ""
+            message = (
+                f"❌ *Limit Order Unfulfilled*{timeframe_str}\n\n"
+                f"Direction: *{direction}*\n"
+                f"Market: *{condition_id[:40]}...*\n"
+                f"Size: *{size} shares @ ${price:.2f}/share*{reason_str}\n\n"
+                f"Order was not matched before the market ended."
+            )
+        self._enqueue_notification(chat_id, message)
+
+    def _enqueue_pending_limit_order(
+        self,
+        order_id: str,
+        condition_id: str,
+        side: str,
+        price: float,
+        size: float,
+        timeframe: str | None,
+        market_end_ts: int | None,
+    ) -> None:
+        """Store a newly placed limit order for fill/cancel tracking."""
+        try:
+            self.db.execute(
+                """
+                INSERT OR IGNORE INTO pending_limit_orders
+                    (user_id, order_id, condition_id, side, price, size, placed_at, market_end_ts, timeframe, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending');
+                """,
+                (self.user_id, order_id, condition_id, side, price, size,
+                 int(time.time()), market_end_ts, timeframe),
+            )
+        except Exception as e:
+            logger.warning("[autotrader:%s] Could not enqueue pending limit order: %s", self.user_id, e)
 
     def _load_traded_condition_ids(self) -> None:
         """Load traded condition_ids from DB to prevent re-trading after restart."""
         try:
             # Create tracking table if not exists
-            self.db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS traded_condition_ids (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    condition_id TEXT,
-                    traded_at INTEGER,
-                    UNIQUE(user_id, condition_id)
-                );
-                """
-            )
+            global _TRADED_TABLE_CREATED
+            if not _TRADED_TABLE_CREATED:
+                with _TRADED_TABLE_LOCK:
+                    if not _TRADED_TABLE_CREATED:
+                        self.db.execute(
+                            """
+                            CREATE TABLE IF NOT EXISTS traded_condition_ids (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                user_id INTEGER,
+                                condition_id TEXT,
+                                traded_at INTEGER,
+                                UNIQUE(user_id, condition_id)
+                            );
+                            """
+                        )
+                        _TRADED_TABLE_CREATED = True
 
             rows = self.db.execute(
                 "SELECT DISTINCT condition_id FROM traded_condition_ids WHERE user_id = ?;",
@@ -269,6 +384,9 @@ class AutoTraderManager:
         """
         Resolve the Polymarket market condition_id for a signal.
         Returns (condition_id, event_slug) or None if resolution fails.
+
+        Uses a module-level cache keyed by (series_slug, window_ts) so repeated
+        calls within the same 5m/15m window skip the Gamma API entirely.
         """
         timeframe = signal.get("timeframe")
         if not timeframe:
@@ -278,6 +396,18 @@ class AutoTraderManager:
         if not series_slug:
             return None
 
+        # Compute the current window boundary (e.g. floor to nearest 5 minutes)
+        interval = TIMEFRAME_INTERVAL_SECONDS.get(timeframe, 300)
+        now = int(time.time())
+        window_ts = (now // interval) * interval
+        cache_key = (series_slug, window_ts)
+
+        with _MARKET_RESOLUTION_CACHE_LOCK:
+            if cache_key in _MARKET_RESOLUTION_CACHE:
+                cached = _MARKET_RESOLUTION_CACHE[cache_key]
+                logger.debug(f"[autotrader:{self.user_id}] Market cache hit for {series_slug} window={window_ts}")
+                return cached
+
         try:
             resolved = _resolve_latest_event_for_series_slug(
                 series_slug,
@@ -285,7 +415,15 @@ class AutoTraderManager:
                 page_size=200,
                 active_only=False,
             )
-            return (resolved.condition_id, resolved.event_slug)
+            result = (resolved.condition_id, resolved.event_slug)
+            with _MARKET_RESOLUTION_CACHE_LOCK:
+                # Evict stale windows to keep memory bounded (keep only last 10 entries)
+                if len(_MARKET_RESOLUTION_CACHE) >= 10:
+                    oldest = next(iter(_MARKET_RESOLUTION_CACHE))
+                    del _MARKET_RESOLUTION_CACHE[oldest]
+                _MARKET_RESOLUTION_CACHE[cache_key] = result
+            logger.info(f"[autotrader:{self.user_id}] Resolved + cached {series_slug} -> {resolved.condition_id[:16]}... window={window_ts}")
+            return result
         except Exception as e:
             logger.error(f"[autotrader:{self.user_id}] Failed to resolve {series_slug}: {e}")
             return None
@@ -376,7 +514,7 @@ class AutoTraderManager:
                 order_log["status"] = "success" if "✅" in result else "failed"
                 self.order_logger.info(json.dumps(order_log))
 
-                # Send Telegram notification on success
+                # Send Telegram notification and track pending order on success
                 if "✅" in result:
                     self._send_signal_trade_notification(
                         condition_id=condition_id,
@@ -385,7 +523,24 @@ class AutoTraderManager:
                         shares=shares,
                         price=self.limit_order_price,
                         timeframe=signal_info.get("timeframe"),
+                        is_limit_order=True,
                     )
+                    # Extract order_id from result to track fill status
+                    order_id_placed = None
+                    for line in result.splitlines():
+                        if line.startswith("Order ID:"):
+                            order_id_placed = line.split(":", 1)[1].strip()
+                            break
+                    if order_id_placed and order_id_placed not in ("N/A", ""):
+                        self._enqueue_pending_limit_order(
+                            order_id=order_id_placed,
+                            condition_id=condition_id,
+                            side=side,
+                            price=self.limit_order_price,
+                            size=shares,
+                            timeframe=signal_info.get("timeframe"),
+                            market_end_ts=signal_info.get("market_end_ts") or signal_info.get("end_ts"),
+                        )
 
                 return result
             else:
@@ -415,6 +570,7 @@ class AutoTraderManager:
                         mapped_side=mapped_side,
                         amount=self.trade_amount_usd,
                         timeframe=signal_info.get("timeframe"),
+                        is_limit_order=False,
                     )
 
                 return result

@@ -427,6 +427,37 @@ class DatabaseManager:
             except sqlite3.OperationalError:
                 pass
 
+            # FOK (market order) mode per timeframe for signal trading.
+            try:
+                conn.execute("ALTER TABLE users ADD COLUMN signal_5m_use_fok INTEGER DEFAULT 0;")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE users ADD COLUMN signal_15m_use_fok INTEGER DEFAULT 0;")
+            except sqlite3.OperationalError:
+                pass
+
+            # Pending limit orders tracker for fill/cancel notifications.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pending_limit_orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    order_id TEXT NOT NULL,
+                    condition_id TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    size REAL NOT NULL,
+                    placed_at INTEGER NOT NULL,
+                    market_end_ts INTEGER,
+                    timeframe TEXT,
+                    notified_at INTEGER,
+                    status TEXT DEFAULT 'pending',
+                    UNIQUE(user_id, order_id)
+                );
+                """
+            )
+
             # Follows relationship for copy trading (follower → leader).
             conn.execute(
                 """

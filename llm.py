@@ -14,13 +14,11 @@ import bot_tools
 load_dotenv()
 
 # -- LLM Configuration --
-# Bypass Cloudflare by talking directly to the Ollama/OpenAI-compatible server.
+# OpenRouter: OpenAI-compatible API with access to many models including free tiers.
 llm = ChatOpenAI(
-    base_url="http://100.78.117.30:6969/v1",
-    # Server expects some auth token but accepts a dummy value.
-    # If OPENAI_API_KEY is not set, default to "abc".
-    api_key=os.getenv("OPENAI_API_KEY", "abc"),
-    model="gpt-oss:120b",
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY", os.getenv("OPENAI_API_KEY", "")),
+    model="nvidia/nemotron-3-super-120b-a12b:free",
     temperature=0.7,
     max_tokens=8096,
     streaming=True,
