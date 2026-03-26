@@ -1050,7 +1050,7 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                     eth_address, eth_private_key,
                     sol_address, sol_private_key,
                     onboarded, invite_code
-                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?);
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, '');
                 """,
                 (
                     user.id,
@@ -1059,9 +1059,26 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
                     db._encrypt_secret(eth_wallet["private_key"]),
                     "",
                     db._encrypt_secret(""),
-                    invite_code.upper(),
                 ),
             )
+
+        success, claim_message = db.claim_invite_code(invite_code, user.id)
+        if not success:
+            db.execute("DELETE FROM users WHERE user_id = ?;", (user.id,))
+            await _send_banner_with_caption(
+                context.bot,
+                update.effective_chat.id,
+                WELCOME_BANNER_PATH,
+                f"❌ {claim_message}\n\n"
+                "Please get a valid invite or referral code and try again.\n\n"
+                "Use: `/join <CODE>`",
+                parse_mode="Markdown",
+            )
+            return
+
+        eth_addr = (eth_wallet.get("address") or "").strip()
+        if eth_addr:
+            db.upsert_polymarket_profile(eth_addr, user.username or "")
 
         db_user = db.get_user(user.id)
 
@@ -1070,7 +1087,7 @@ def create_telegram_application(db: DatabaseManager, bot_token: str) -> Applicat
             update.effective_chat.id,
             WELCOME_BANNER_PATH,
             f"✅ Welcome, {user.first_name}!\n\n"
-            f"Invite code accepted. Wallet generated.\n\n"
+            f"Invite or referral code accepted. Wallet generated.\n\n"
             f"Polygon address:\n`{db_user['eth_address']}`\n\n"
             f"Tap **Main Menu** below to get started.",
             parse_mode="Markdown",

@@ -1348,70 +1348,96 @@ class DatabaseManager:
     def validate_invite_code(self, code: str) -> tuple[bool, str]:
         """
         Validate an invite code. Returns (is_valid, message).
+        Also accepts a valid referral code (8-char) as platform access.
         """
         code = code.upper().strip()
         code_data = self.get_invite_code(code)
-        if not code_data:
+        if code_data:
+            import time
+            now = int(time.time())
+
+            # Check expiry
+            if code_data.get("expires_at") and code_data["expires_at"] < now:
+                return False, "Invite code has expired."
+
+            # Check max uses
+            max_uses = code_data.get("max_uses")
+            if max_uses and code_data["current_uses"] >= max_uses:
+                return False, "Invite code has been used the maximum number of times."
+
+            return True, "Valid invite code."
+
+        from referral_helpers import REFERRAL_CODE_LENGTH, normalize_referral_code
+
+        norm = normalize_referral_code(code)
+        if len(norm) != REFERRAL_CODE_LENGTH:
             return False, "Invalid invite code."
 
-        import time
-        now = int(time.time())
-
-        # Check expiry
-        if code_data.get("expires_at") and code_data["expires_at"] < now:
-            return False, "Invite code has expired."
-
-        # Check max uses
-        max_uses = code_data.get("max_uses")
-        if max_uses and code_data["current_uses"] >= max_uses:
-            return False, "Invite code has been used the maximum number of times."
-
-        return True, "Valid invite code."
+        row = self.execute(
+            "SELECT 1 AS ok FROM referral_codes WHERE code = ? LIMIT 1;",
+            (norm,),
+        ).fetchone()
+        if row:
+            return True, "Valid invite code."
+        return False, "Invalid invite code."
 
     def claim_invite_code(self, code: str, user_id: int) -> tuple[bool, str]:
         """
         Claim an invite code for a user. Returns (success, message).
+        If the code is not an admin invite, tries a referral code (XP + onboarding).
         """
         code = code.upper().strip()
         code_data = self.get_invite_code(code)
 
-        if not code_data:
+        if code_data:
+            import time
+            now = int(time.time())
+
+            # Check expiry
+            if code_data.get("expires_at") and code_data["expires_at"] < now:
+                return False, "Invite code has expired."
+
+            # Check max uses
+            max_uses = code_data.get("max_uses")
+            if max_uses and code_data["current_uses"] >= max_uses:
+                return False, "Invite code has been used the maximum number of times."
+
+            with self.transaction() as conn:
+                # Mark code as claimed
+                conn.execute(
+                    """
+                    UPDATE invite_codes
+                    SET current_uses = current_uses + 1, claimed_by = ?
+                    WHERE code = ?;
+                    """,
+                    (user_id, code),
+                )
+
+                # Mark user as onboarded with their invite code
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET onboarded = 1, invite_code = ?
+                    WHERE user_id = ?;
+                    """,
+                    (code, user_id),
+                )
+
+            return True, "Successfully claimed invite code."
+
+        from referral_helpers import REFERRAL_CODE_LENGTH, execute_referral_claim, normalize_referral_code
+
+        norm = normalize_referral_code(code)
+        if len(norm) != REFERRAL_CODE_LENGTH:
             return False, "Invalid invite code."
 
-        import time
-        now = int(time.time())
-
-        # Check expiry
-        if code_data.get("expires_at") and code_data["expires_at"] < now:
-            return False, "Invite code has expired."
-
-        # Check max uses
-        max_uses = code_data.get("max_uses")
-        if max_uses and code_data["current_uses"] >= max_uses:
-            return False, "Invite code has been used the maximum number of times."
-
-        with self.transaction() as conn:
-            # Mark code as claimed
-            conn.execute(
-                """
-                UPDATE invite_codes
-                SET current_uses = current_uses + 1, claimed_by = ?
-                WHERE code = ?;
-                """,
-                (user_id, code),
-            )
-
-            # Mark user as onboarded with their invite code
-            conn.execute(
-                """
-                UPDATE users
-                SET onboarded = 1, invite_code = ?
-                WHERE user_id = ?;
-                """,
-                (code, user_id),
-            )
-
-        return True, "Successfully claimed invite code."
+        result = execute_referral_claim(self, user_id, norm)
+        if result.get("success"):
+            return True, "Successfully onboarded with referral code."
+        msg = result.get("message") or "Invalid referral code."
+        if msg == "Invalid referral code.":
+            return False, "Invalid invite code."
+        return False, msg
 
     def get_invite_codes_for_user(self, created_by: int) -> list[dict]:
         """
